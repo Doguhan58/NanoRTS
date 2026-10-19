@@ -7,3 +7,4 @@ build/
 .ruff_cache/
 play.gif
 play-frame.png
+.scratch/

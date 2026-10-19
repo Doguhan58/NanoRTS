@@ -67,7 +67,9 @@ def sample_actions(key, mask, widths):
 
 # The Environment
 ## Scenarios
-Two release maps ship with the package:
+The maps of MicroRTS's [`maps/`](https://github.com/Farama-Foundation/MicroRTS/tree/master/maps) folder ship with the package, from 4 x 4 up to the 128 x 128 BroodWar maps, under `nanorts/maps/`. A scenario is named by its file name without `.xml`, for example `"basesWorkers12x12"`, `"GardenOfWar64x64"` or `"(4)Fortress.scxA"`, and `nanorts.scenario_names()` lists all 138.
+
+The bots and the speed figures were measured on the two release maps:
 
 | Scenario | Field | Unit slots per player |
 |:--|:--|:--|
