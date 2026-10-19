@@ -27,3 +27,21 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nanorts", "baselines"]
+
+[tool.ruff]
+target-version = "py313"
+src = ["src"]
+
+[tool.ruff.lint]
+extend-select = ["I", "UP", "B", "SIM", "RET", "C4"]
+
+[tool.ruff.lint.flake8-bugbear]
+
+extend-immutable-calls = [
+    "nanorts.model.leaf.leaf",
+    "nanorts.model.leaf.nested",
+    "nanorts.model.leaf.static",
+    "nanorts.model.leaf",
+    "nanorts.model.nested",
+    "nanorts.model.static",
+]
