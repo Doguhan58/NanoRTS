@@ -123,7 +123,8 @@ def _warn_once(reason: str) -> None:
     except RuntimeError:
         return
     warnings.warn(
-        f"{library.SWITCH}=1, but nanoRTS runs its JAX programs: {reason}",
+        f"nanoRTS runs its JAX programs: {reason}; set {library.SWITCH}=0 to "
+        "skip the kernels",
         UserWarning,
         stacklevel=4,
     )

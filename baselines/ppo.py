@@ -1513,7 +1513,7 @@ def train(config: Config) -> Path:
     if config.eval_every and config.roster_every and not roster_runs():
         print(
             "the roster evaluation runs on CUDA's Kernel path only and is "
-            "skipped: set NANORTS_KERNELS=1 to play it",
+            "skipped: the kernels are off or unavailable",
             flush=True,
         )
     if not config.run_name:

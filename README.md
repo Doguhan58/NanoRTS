@@ -315,13 +315,14 @@ Measured on one RTX 4090 with JAX 0.11.1 and both compiler option sets from [Run
 | `basesWorkers16x16` | symbolic, partial observability | 1.8 M |
 
 ## CUDA Kernels
-On NVIDIA GPUs, NanoRTS can replace parts of the step, and of the bots, with hand-written CUDA kernels. They give the same results as the JAX code. Turn them on before importing NanoRTS:
-```
-export NANORTS_KERNELS=1
-```
-On the first import, the kernels are built with the `nvcc` that NanoRTS installs and the system `g++`, into `~/.cache/nanorts/kernels` (set `NANORTS_KERNEL_CACHE` to change it). The build takes a few minutes of CPU time.
+On NVIDIA GPUs, NanoRTS replaces parts of the step, and of the bots, with hand-written CUDA kernels. They give the same results as the JAX code and are on by default.
 
-If the build fails, NanoRTS warns once and runs the JAX code. On a machine without an NVIDIA GPU, the switch does nothing.
+On the first import on Linux, the kernels are built with the `nvcc` that NanoRTS installs and the system `g++`, into `~/.cache/nanorts/kernels` (set `NANORTS_KERNEL_CACHE` to change it). The build takes a few minutes of CPU time, and it also runs on a machine without an NVIDIA GPU, where the JAX code runs anyway.
+
+If the build fails, NanoRTS warns once on a GPU and runs the JAX code. To run the JAX code and skip the build, turn the kernels off before importing NanoRTS:
+```
+export NANORTS_KERNELS=0
+```
 
 # Gotchas
 ### Keys
@@ -346,5 +347,5 @@ An illegal action does not raise an error: it becomes a timed `NONE`, as in Java
 - Pixel observations are large: with final observations on, 4,096 16x16 games produce about 3 GB of images per step. Prefer the symbolic surface together with `pixels_from_symbolic`.
 
 ### Import time
-`import nanorts` is cheap. The first use of `nanorts.make` imports `jaxmarl`, which takes about a second.
+`import nanorts` is cheap once the [CUDA kernels](#cuda-kernels) are built; the first import on Linux builds them. The first use of `nanorts.make` imports `jaxmarl`, which takes about a second.
 

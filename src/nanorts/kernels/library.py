@@ -64,11 +64,11 @@ def _load() -> tuple[_Library | None, str]:
     ), ""
 
 
-SELECTED: bool = os.environ.get(SWITCH) == "1"
+SELECTED: bool = os.environ.get(SWITCH) != "0"
 
 LIBRARY: _Library | None
 REASON: str
-LIBRARY, REASON = _load() if SELECTED else (None, f"{SWITCH} is not 1")
+LIBRARY, REASON = _load() if SELECTED else (None, f"{SWITCH} is 0")
 
 
 def build_id() -> str | None:
