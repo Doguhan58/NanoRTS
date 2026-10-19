@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+play.gif
+play-frame.png
