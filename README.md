@@ -10,11 +10,11 @@ NanoRTS is a two-player [JaxMARL](https://github.com/FLAIROx/JaxMARL) environmen
 
 
 # Installation
-NanoRTS needs Python 3.13 on Linux (x86_64 or aarch64). Install it from GitHub:
+NanoRTS needs Python 3.13 on Linux (x86_64 or aarch64). Install it from GitHub (currently not on PyPI, to import into your project):
 ```
 pip install git+https://github.com/Doguhan58/NanoRTS.git
 ```
-To work on NanoRTS itself, clone it and let [uv](https://github.com/astral-sh/uv) create the environment from the lock file:
+Or to work with the repository itself, clone it and let [uv](https://github.com/astral-sh/uv) create the environment from the lock file:
 ```
 git clone https://github.com/Doguhan58/NanoRTS.git
 cd NanoRTS
