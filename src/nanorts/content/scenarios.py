@@ -22,7 +22,7 @@ CAPACITY_PROFILES: Final[Mapping[str, int]] = MappingProxyType(
 )
 
 
-def map_name_to_scenario(name: str, *, utt: UnitTypeTableVersion = UnitTypeTableVersion.ORIGINAL, conflict_strategy: ConflictStrategy = ConflictStrategy.CANCEL_BOTH, max_cycles: int = 5000, capacity_profile: bool = True) -> GameConfig:
+def map_name_to_scenario(name: str, *, utt: UnitTypeTableVersion = UnitTypeTableVersion.ORIGINAL_FINETUNED, conflict_strategy: ConflictStrategy = ConflictStrategy.CANCEL_BOTH, max_cycles: int = 5000, capacity_profile: bool = True) -> GameConfig:
     path = _shipped_path(name, "map_name_to_scenario")
     game = load_game(
         path,

@@ -701,7 +701,7 @@ def parse_arguments() -> argparse.Namespace:
         "--utt",
         type=model.UnitTypeTableVersion,
         choices=tuple(model.UnitTypeTableVersion),
-        default=model.UnitTypeTableVersion.ORIGINAL)
+        default=model.UnitTypeTableVersion.ORIGINAL_FINETUNED)
     parser.add_argument(
         "--conflict-strategy",
         type=model.ConflictStrategy,

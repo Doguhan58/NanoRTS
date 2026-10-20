@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 from collections.abc import Sequence
@@ -23,6 +24,7 @@ from nanorts.model import (
     UnitType,
     UnitTypeTableVersion,
     check_state_invariants,
+    content_hash,
     validate,
 )
 
@@ -111,7 +113,7 @@ def _attribute_integer(element: ElementTree.Element, name: str, *, clause: int) 
     return int(text)
 
 
-def load_game(path: str | os.PathLike[str], *, utt: UnitTypeTableVersion = UnitTypeTableVersion.ORIGINAL, conflict_strategy: ConflictStrategy = ConflictStrategy.CANCEL_BOTH, max_cycles: int = 5000, bucket: BucketSpec | None = None) -> GameConfig:
+def load_game(path: str | os.PathLike[str], *, utt: UnitTypeTableVersion = UnitTypeTableVersion.ORIGINAL_FINETUNED, conflict_strategy: ConflictStrategy = ConflictStrategy.CANCEL_BOTH, max_cycles: int = 5000, bucket: BucketSpec | None = None) -> GameConfig:
     table = _supported_table(utt, conflict_strategy)
     text = Path(path).read_text(encoding="utf-8")
     return _assemble_game(
@@ -119,7 +121,7 @@ def load_game(path: str | os.PathLike[str], *, utt: UnitTypeTableVersion = UnitT
     )
 
 
-def build_game(*, width: int, height: int, terrain: str, players: Sequence[int], units: Sequence[UnitRecord], utt: UnitTypeTableVersion = UnitTypeTableVersion.ORIGINAL, conflict_strategy: ConflictStrategy = ConflictStrategy.CANCEL_BOTH, max_cycles: int = 5000, bucket: BucketSpec | None = None) -> GameConfig:
+def build_game(*, width: int, height: int, terrain: str, players: Sequence[int], units: Sequence[UnitRecord], utt: UnitTypeTableVersion = UnitTypeTableVersion.ORIGINAL_FINETUNED, conflict_strategy: ConflictStrategy = ConflictStrategy.CANCEL_BOTH, max_cycles: int = 5000, bucket: BucketSpec | None = None) -> GameConfig:
     table = _supported_table(utt, conflict_strategy)
     document = ContentDocument(
         width=width,
@@ -129,6 +131,30 @@ def build_game(*, width: int, height: int, terrain: str, players: Sequence[int],
         units=tuple(units),
     )
     return _assemble_game(document, table, utt, conflict_strategy, max_cycles, bucket)
+
+
+def with_unit_type_table(game: GameConfig, utt: UnitTypeTableVersion) -> GameConfig:
+    if utt == game.bucket.utt_identity:
+        return game
+    table = _supported_table(utt, game.bucket.conflict_strategy)
+    names = tuple(unit.name for unit in table)
+    if names != tuple(unit.name for unit in game.unit_types):
+        raise ContentError(
+            f"unit type table {utt} declares the types {list(names)}, which "
+            f"are not the scenario's {[unit.name for unit in game.unit_types]}"
+        )
+    window = (2 * max(unit.attack_range for unit in table) + 1) ** 2
+    if window != game.bucket.attack_offset_capacity:
+        raise ContentError(
+            f"unit type table {utt} derives an attack window of {window} "
+            f"offsets, not the scenario's {game.bucket.attack_offset_capacity}"
+        )
+    bucket = dataclasses.replace(
+        game.bucket, utt_identity=utt, utt_content_hash=content_hash(table)
+    )
+    config = dataclasses.replace(game, unit_types=table, bucket=bucket)
+    validate(config, bucket)
+    return config
 
 
 def _supported_table(utt: UnitTypeTableVersion, conflict_strategy: ConflictStrategy) -> tuple[UnitType, ...]:

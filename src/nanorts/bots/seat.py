@@ -13,7 +13,14 @@ from jaxmarl.environments.multi_agent_env import MultiAgentEnv
 
 from nanorts.adapters import EnvironmentState, episode_root, jaxmarl, select
 from nanorts.bots.bot import Bot, turn_key
-from nanorts.model import PLAYER_COUNT, Commands, GameConfig, ModelError, Telemetry
+from nanorts.model import (
+    PLAYER_COUNT,
+    Commands,
+    GameConfig,
+    ModelError,
+    Telemetry,
+    UnitTypeTableVersion,
+)
 
 LEARNER: Final[str] = "learner"
 
@@ -143,7 +150,7 @@ def seat_slot_cells(seat_state: SeatState[Any], game: GameConfig, *, layout: jax
 
 
 class SeatEnv(MultiAgentEnv):
-    def __init__(self, bot: Bot[Any], *, scenario: GameConfig, seat: str = "player_0", surface: str = "symbolic", partial_observability: bool = False, final_observation: bool = True, feature_dtype: DTypeLike | None = None, reward_components: bool = False) -> None:
+    def __init__(self, bot: Bot[Any], *, scenario: GameConfig, utt: UnitTypeTableVersion | None = None, seat: str = "player_0", surface: str = "symbolic", partial_observability: bool = False, final_observation: bool = True, feature_dtype: DTypeLike | None = None, reward_components: bool = False) -> None:
         if seat not in SEAT_RULES:
             raise ModelError(
                 f"SeatEnv refuses seat={seat!r}: the accepted rules are "
@@ -153,6 +160,7 @@ class SeatEnv(MultiAgentEnv):
         two_agent = jaxmarl.make(
             "NanoRTS",
             scenario=scenario,
+            utt=utt,
             surface=surface,
             partial_observability=partial_observability,
             final_observation=final_observation,

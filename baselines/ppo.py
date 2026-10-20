@@ -27,6 +27,7 @@ from jax import Array
 import nanorts
 from nanorts import bots, kernels, rendering
 from nanorts.adapters import jaxmarl
+from nanorts.model import UnitTypeTableVersion
 
 
 def _process_start() -> float:
@@ -106,6 +107,7 @@ class Config:
     output_dir: str = "runs"
 
     map: str = "basesWorkers8x8"
+    utt: str = "VERSION_ORIGINAL_FINETUNED"
     groups: tuple[GroupSpec, ...] = tuple(
         GroupSpec(opponent, 1)
         for opponent in (
@@ -118,7 +120,7 @@ class Config:
     )
     lanes: int = 4100
     seat: str = "drawn"
-    max_cycles: int = 2000
+    max_cycles: int = 5000
     reward_weights: tuple[float, ...] = (1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     seed: int = 1
 
@@ -327,6 +329,7 @@ def _checked(config: Config) -> Config:
         raise ConfigError(f"window={config.window}; an odd side of at most 7")
     for name, allowed in (
         ("dtype", tuple(DTYPES)),
+        ("utt", tuple(member.value for member in UnitTypeTableVersion)),
         ("seat", bots.SEAT_RULES),
         ("wandb_mode", WANDB_MODES),
     ):
@@ -639,7 +642,9 @@ def criterion_wins(games: int) -> int:
 
 
 def _scenario(config: Config) -> Any:
-    return nanorts.map_name_to_scenario(config.map, max_cycles=config.max_cycles)
+    return nanorts.map_name_to_scenario(
+        config.map, utt=UnitTypeTableVersion(config.utt), max_cycles=config.max_cycles
+    )
 
 
 def _mix(groups: Sequence[tuple[str, str, int]], config: Config, *, final_observation: bool = False, reward_components: bool = False) -> Any:

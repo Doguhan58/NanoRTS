@@ -69,23 +69,28 @@ def sample_actions(key, mask, widths):
 ## Scenarios
 The maps of MicroRTS's [`maps/`](https://github.com/Farama-Foundation/MicroRTS/tree/master/maps) folder ship with the package, from 4 x 4 up to the 128 x 128 BroodWar maps, under `nanorts/maps/`. A scenario is named by its file name without `.xml`, for example `"basesWorkers12x12"`, `"GardenOfWar64x64"` or `"(4)Fortress.scxA"`, and `nanorts.scenario_names()` lists all 138.
 
-The bots and the speed figures were measured on the two release maps:
+The bots and the speed figures were measured on the two release maps, under `VERSION_ORIGINAL`:
 
 | Scenario | Field | Unit slots per player |
 |:--|:--|:--|
 | `basesWorkers8x8` | 8 x 8 | 47 |
 | `basesWorkers16x16` | 16 x 16 | 70 |
 
-`map_name_to_scenario` takes Java's defaults, each as a keyword:
+`map_name_to_scenario` takes the rules as keywords:
 ```python
-from nanorts.model import ConflictStrategy
+from nanorts.model import ConflictStrategy, UnitTypeTableVersion
 
 scenario = nanorts.map_name_to_scenario(
     "basesWorkers16x16",
+    utt=UnitTypeTableVersion.ORIGINAL,
     conflict_strategy=ConflictStrategy.CANCEL_RANDOM,
     max_cycles=3000,
 )
 ```
+- `utt` is the unit type table:
+  - `VERSION_ORIGINAL_FINETUNED` (the default) is the table of the microRTS competition's classic track.
+  - `VERSION_ORIGINAL` is Java's and MicroRTS-Py's default.
+  - They differ in five values. Under the default, Heavy costs 3 (instead of 2), has 8 hit points (instead of 4) and moves in 10 cycles (instead of 12), a Base takes 200 cycles to build (instead of 250), and a Barracks 100 (instead of 200).
 - `conflict_strategy` decides two units that claim the same cell in the same cycle: `CANCEL_BOTH` (the default), `CANCEL_RANDOM` or `CANCEL_ALTERNATING`.
 - `max_cycles` is the time limit, the default is 5000.
 - `capacity_profile=False` gives 16x16 the larger slot count that can never overflow (107 instead of 70, see [Gotchas](#-gotchas)).
@@ -149,6 +154,7 @@ Episodes reset automatically inside `step`.
 env = nanorts.make(
     "NanoRTS",
     scenario=scenario,
+    utt=None,                     # keep the scenario's unit type table, or a UnitTypeTableVersion
     surface="symbolic",           # or "pixels"
     partial_observability=False,  # fog of war
     final_observation=True,       # False drops infos["final_observation"]
@@ -286,15 +292,16 @@ The window shows the board. The terminal shows the clock, both players' resource
 | g / m | save a frame / record a GIF |
 | esc / q | quit |
 
-Options include `--map`, `--seed`, `--max-cycles`, `--conflict-strategy`, `--cell-pixels` and `--device cuda`; see `play --help`. The first frame takes a few seconds to compile.
+Options include `--map`, `--seed`, `--max-cycles`, `--utt`, `--conflict-strategy`, `--cell-pixels` and `--device cuda`; see `play --help`. The first frame takes a few seconds to compile.
 
 
 # MicroRTS-Py GridNet
-`nanorts.adapters.gridnet` reproduces MicroRTS-Py's full-observation GridNet interface: one game with both players stepped together, actions per board cell, 29 one-hot planes, and per-cell masks. It is a set of pure functions over a prepared layout:
+`nanorts.adapters.gridnet` reproduces MicroRTS-Py's full-observation GridNet interface: one game with both players stepped together, actions per board cell, 29 one-hot planes, and per-cell masks. MicroRTS-Py plays `VERSION_ORIGINAL`, so build the scenario with that table to play its rules. It is a set of pure functions over a prepared layout:
 ```python
 from nanorts.adapters import gridnet
+from nanorts.model import UnitTypeTableVersion
 
-game = nanorts.map_name_to_scenario("basesWorkers8x8")
+game = nanorts.map_name_to_scenario("basesWorkers8x8", utt=UnitTypeTableVersion.ORIGINAL)
 layout = gridnet.prepare(game)
 env_state, observation = gridnet.reset(jax.random.key(0), game, layout=layout)
 # observation.planes: int32[2, H, W, 29], observation.action_mask: int32[2, H, W, 78]
@@ -306,7 +313,7 @@ The bots seat against GridNet through `bots.reset_gridnet_seat`, `bots.step_grid
 # Performance
 These numbers are environment steps per second, summed over 4,096 parallel games. One step is one game cycle for both players. Every game is played from mid-game positions, from its own masks with sampled actions, so the games diverge as they would in training.
 
-Measured on one RTX 4090 with JAX 0.11.1 and both compiler option sets from [Running Thousands of Environments](#-running-thousands-of-environments):
+Measured on one RTX 4090 with JAX 0.11.1, `VERSION_ORIGINAL` and both compiler option sets from [Running Thousands of Environments](#-running-thousands-of-environments):
 
 | Scenario | Surface | Steps per second |
 |:--|:--|--:|
@@ -336,7 +343,10 @@ export NANORTS_KERNELS=0
 Pass `RECOMMENDED_COMPILER_OPTIONS` only to your outermost `jax.jit`. If a `jit` that carries `compiler_options` is traced inside another `jit`, JAX raises a `ValueError`.
 
 ### Slot capacity on 16x16
-By default, `basesWorkers16x16` gives each player 70 unit slots. That number is measured, not a proven bound. If a game ever needs more, `infos["spawn_overflowed"]` is set for the rest of that episode. Use `map_name_to_scenario(..., capacity_profile=False)` for 107 slots, which cannot overflow, but is significantly slower (1.6x times measured).
+By default, `basesWorkers16x16` gives each player 70 unit slots. That number was measured under `VERSION_ORIGINAL` and is not a proven bound. If a game ever needs more, `infos["spawn_overflowed"]` is set for the rest of that episode. Use `map_name_to_scenario(..., capacity_profile=False)` for 107 slots, which cannot overflow, but is significantly slower (1.6x times measured).
+
+### Unit type table
+The default table is `VERSION_ORIGINAL_FINETUNED`, not the `VERSION_ORIGINAL` of Java's `new UnitTypeTable()` and of MicroRTS-Py. Pass `utt=UnitTypeTableVersion.ORIGINAL` to `map_name_to_scenario`, `load_game` or `nanorts.make` to compare with MicroRTS-Py. Units placed by a map file keep the hit points the file declares, as in Java, so the Heavies of the `melee*Mixed*` maps start with 4 of their 8 hit points.
 
 ### Feature map dtype
 Feature maps are `uint8` by default, and arithmetic on them wraps at 255. Cast them before computing with them, or pass `feature_dtype=jnp.int32`.

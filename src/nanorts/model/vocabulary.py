@@ -44,6 +44,7 @@ DIRECTION_OFFSETS: Final[tuple[tuple[int, int], ...]] = (
 
 class UnitTypeTableVersion(enum.StrEnum):
     ORIGINAL = "VERSION_ORIGINAL"
+    ORIGINAL_FINETUNED = "VERSION_ORIGINAL_FINETUNED"
 
 
 class ConflictStrategy(enum.StrEnum):

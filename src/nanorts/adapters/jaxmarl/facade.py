@@ -11,7 +11,7 @@ from jax.typing import DTypeLike
 from jaxmarl.environments import spaces
 from jaxmarl.environments.multi_agent_env import MultiAgentEnv
 
-from nanorts import observations, rendering
+from nanorts import content, observations, rendering
 from nanorts.adapters.jaxmarl.actions import AvailActions, legal_actions, slot_cells
 from nanorts.adapters.jaxmarl.env import (
     JaxMARLStep,
@@ -23,21 +23,21 @@ from nanorts.adapters.jaxmarl.env import (
 from nanorts.adapters.jaxmarl.layout import AGENTS, JaxMARLLayout, prepare
 from nanorts.adapters.jaxmarl.observation import Observations, observe
 from nanorts.adapters.lifecycle import EnvironmentState, spawn_overflowed
-from nanorts.model import PLAYER_COUNT, GameConfig, ModelError
+from nanorts.model import PLAYER_COUNT, GameConfig, ModelError, UnitTypeTableVersion
 
 ALL_AGENTS: Final[str] = "__all__"
 
 ENVIRONMENT_IDS: Final[tuple[str, ...]] = ("NanoRTS",)
 
 
-def make(env_id: str, *, scenario: GameConfig, surface: str = "symbolic", partial_observability: bool = False, final_observation: bool = True, feature_dtype: DTypeLike | None = None, reward_components: bool = False) -> NanoRTS:
+def make(env_id: str, *, scenario: GameConfig, utt: UnitTypeTableVersion | None = None, surface: str = "symbolic", partial_observability: bool = False, final_observation: bool = True, feature_dtype: DTypeLike | None = None, reward_components: bool = False) -> NanoRTS:
     if env_id not in ENVIRONMENT_IDS:
         raise ModelError(
             f"jaxmarl.make refuses environment id {env_id!r}: the accepted ids are "
             f"{list(ENVIRONMENT_IDS)}"
         )
     return NanoRTS(
-        scenario,
+        scenario if utt is None else content.with_unit_type_table(scenario, utt),
         surface=surface,
         partial_observability=partial_observability,
         final_observation=final_observation,

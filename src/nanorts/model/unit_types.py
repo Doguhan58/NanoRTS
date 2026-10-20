@@ -129,10 +129,21 @@ TYPE_RANGED: Final[int] = _ORDER.index(_RANGED)
 
 TYPE_NAMES: Final[tuple[str, ...]] = tuple(unit.name for unit in _ORDER)
 
+_FINETUNED_ORDER: Final[tuple[UnitType, ...]] = (
+    _RESOURCE,
+    dataclasses.replace(_BASE, produce_time=200),
+    dataclasses.replace(_BARRACKS, produce_time=100),
+    _WORKER,
+    _LIGHT,
+    dataclasses.replace(_HEAVY, cost=3, hit_points=8, move_time=10),
+    _RANGED,
+)
+
 
 TABLES: Final[Mapping[UnitTypeTableVersion, tuple[UnitType, ...]]] = MappingProxyType(
     {
         UnitTypeTableVersion.ORIGINAL: _ORDER,
+        UnitTypeTableVersion.ORIGINAL_FINETUNED: _FINETUNED_ORDER,
     }
 )
 
