@@ -794,40 +794,77 @@ def roster_runs() -> bool:
     return jax.default_backend() != "gpu" or kernels.selected()
 
 
+def evaluation_opponents(config: Config, *, roster: bool) -> tuple[str, ...]:
+    return tuple(bots.ROSTER) if roster else config.eval_opponents
+
+
 def evaluation_cases(config: Config, *, roster: bool) -> tuple[tuple[str, str], ...]:
-    opponents = tuple(bots.ROSTER) if roster else config.eval_opponents
     return tuple(
-        (opponent, seat) for opponent in opponents for seat in config.eval_seats
+        (opponent, seat)
+        for opponent in evaluation_opponents(config, roster=roster)
+        for seat in config.eval_seats
     )
 
 
 def video_opponents(config: Config, *, roster: bool) -> tuple[str, ...]:
-    cases = evaluation_cases(config, roster=roster)
-    return tuple(dict.fromkeys(opponent for opponent, _ in cases))
+    return tuple(dict.fromkeys(evaluation_opponents(config, roster=roster)))
+
+
+def _seated_reset(environment: Any, roots: Array, seats: Array) -> tuple[Any, Any]:
+    return jax.vmap(
+        lambda root, seat: bots.reset_seat(
+            root,
+            environment.game,
+            bot=environment.bot,
+            layout=environment.layout,
+            assets=environment.assets,
+            seat=seat,
+        )
+    )(roots, seats)
 
 
 class Evaluation:
     def __init__(self, config: Config, *, roster: bool, videos: bool) -> None:
         self.config = config
         self.cases = evaluation_cases(config, roster=roster)
+        opponents = evaluation_opponents(config, roster=roster)
+        seats = config.eval_seats
+        seat_rule = seats[0] if len(set(seats)) == 1 else "drawn"
         mix = _mix(
-            [(opponent, seat, config.eval_games) for opponent, seat in self.cases],
+            [
+                (opponent, seat_rule, len(seats) * config.eval_games)
+                for opponent in opponents
+            ],
             config,
             final_observation=videos,
+        )
+        self.lane_seats = np.repeat(
+            np.asarray([jaxmarl.AGENTS.index(seat) for seat in seats], np.int32),
+            config.eval_games,
         )
         self.layout = _RowLayout(mix)
         self.model = network(config)
         self.videos = videos
         starts: dict[str, int] = {}
-        for (opponent, _), rows in zip(self.cases, mix.slices(), strict=True):
+        for opponent, rows in zip(opponents, mix.slices(), strict=True):
             starts.setdefault(opponent, rows.start)
         self.video_rows = np.asarray(list(starts.values()), np.int32)
 
     def play(self, params: Any, key: Array) -> tuple[Array, Array | None, Array]:
         mix, cycles = self.layout.mix, self.config.max_cycles
         key, environment_key = jax.random.split(key)
-        observations, states = mix.reset(jax.random.split(environment_key, mix.lanes))
-        start = observations.feature_maps
+        roots = jax.random.split(environment_key, mix.lanes)
+        lane_seats = jnp.asarray(self.lane_seats)
+        states, observations = zip(
+            *(
+                _seated_reset(group.environment, roots[bounds], lane_seats)
+                for group, bounds in zip(mix.groups, mix.slices(), strict=True)
+            ),
+            strict=True,
+        )
+        start = jnp.concatenate(
+            [observation.feature_maps for observation in observations]
+        )
         rows = jnp.asarray(self.video_rows)
         frames = None
         if self.videos:
@@ -891,7 +928,10 @@ class Evaluation:
                 frames=frames,
             ),
         )
-        return self.layout.per_group(final.outcome), final.frames, final.lengths
+        outcomes = final.outcome.reshape(
+            len(self.cases), self.config.eval_games, len(OUTCOMES)
+        )
+        return outcomes.sum(1, dtype=jnp.int32), final.frames, final.lengths
 
 
 class Trajectory(NamedTuple):
