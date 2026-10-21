@@ -370,7 +370,7 @@ def plain(config: Config) -> dict[str, Any]:
     }
 
 
-def _planes(values: Array) -> Array:
+def _planes(values: Array, dtype: Any = jnp.float32) -> Array:
     return jnp.concatenate(
         [
             jax.nn.one_hot(
@@ -380,7 +380,7 @@ def _planes(values: Array) -> Array:
                     jnp.clip(values[..., index], 0, width - 1),
                 ),
                 width,
-                dtype=jnp.float32,
+                dtype=dtype,
             )
             for index, width in enumerate(PLANES)
         ],
@@ -393,28 +393,38 @@ def flat_planes(feature_maps: Array) -> Array:
 
 
 @functools.cache
-def _window_table(height: int, width: int, window: int) -> np.ndarray:
+def _window_table(height: int, width: int, window: int) -> tuple[np.ndarray, np.ndarray]:
     side = width + window - 1
+    radius = window // 2
     y, x = np.divmod(np.arange(height * width), width)
     dy, dx = np.divmod(np.arange(window * window), window)
-    return ((y[:, None] + dy) * side + x[:, None] + dx).astype(np.int32)
+    row, column = y[:, None] + dy, x[:, None] + dx
+    outside = (
+        (row < radius)
+        | (row >= height + radius)
+        | (column < radius)
+        | (column >= width + radius)
+    )
+    return (row * side + column).astype(np.int32), outside
 
 
-def slot_features(feature_maps: Array, cells: Array, mask: Array, *, window: int) -> Array:
+def slot_features(feature_maps: Array, cells: Array, mask: Array, *, window: int, dtype: Any) -> Array:
     batch, height, width, maps = feature_maps.shape
     radius = window // 2
     grid = jnp.pad(
-        feature_maps.astype(jnp.int32),
-        ((0, 0), (radius, radius), (radius, radius), (0, 0)),
-        constant_values=-1,
+        feature_maps, ((0, 0), (radius, radius), (radius, radius), (0, 0))
     ).reshape(batch, -1, maps)
-    table = jnp.asarray(_window_table(height, width, window))
-    index = table[jnp.maximum(cells, 0)].reshape(batch, -1)
-    values = jax.vmap(lambda rows, at: rows[at])(grid, index)
-    planes = _planes(values).reshape(*cells.shape, -1)
+    table, outside = _window_table(height, width, window)
+    cell = jnp.maximum(cells, 0)
+    index = jnp.asarray(table)[cell].reshape(batch, -1)
+    values = jax.vmap(lambda rows, at: rows[at])(grid, index).astype(jnp.int32)
+    values = jnp.where(
+        jnp.asarray(outside)[cell].reshape(batch, -1)[..., None], -1, values
+    )
+    planes = _planes(values, dtype).reshape(*cells.shape, -1)
     position = cells[..., None] == jnp.arange(height * width, dtype=cells.dtype)
     return jnp.concatenate(
-        [planes, mask.astype(jnp.float32), position.astype(jnp.float32)], axis=-1
+        [planes, mask.astype(dtype), position.astype(dtype)], axis=-1
     )
 
 
@@ -445,9 +455,11 @@ class SlotActorCritic(nn.Module):
 
     def __call__(self, feature_maps: Array, cells: Array, mask: Array) -> tuple[Array, Array]:
         inputs = flat_planes(feature_maps).astype(DTYPES[self.dtype])
-        slots = slot_features(feature_maps, cells, mask, window=self.window)
+        slots = slot_features(
+            feature_maps, cells, mask, window=self.window, dtype=jnp.int8
+        )
         hidden = nn.relu(
-            self.slot_input(slots.astype(DTYPES[self.dtype]))
+            self.slot_input(slots)
             + self.slot_context(self._trunk(self.actor, inputs))[:, None, :]
         )
         return self.slot_logits(hidden), self._value(inputs)
