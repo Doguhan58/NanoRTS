@@ -420,49 +420,85 @@ def _openable(seen: _Seen, cell: Array) -> Array:
     return (cell != ABSENT) & ~_at(seen.wall, cell) & ~_at(seen.occupied, cell)
 
 
-def _proximity(seen: _Seen, turn: _Turn, goal: Array, neighbour: Array, active: Array, bucket: BucketSpec) -> Array:
-    shape = (bucket.height, bucket.width)
-    every = jnp.arange(bucket.cell_count, dtype=jnp.int32)
-    blocked = (seen.wall | turn.taken | seen.occupied).reshape(shape)
-    opening = jnp.any(
-        (every == neighbour[:, None]) & _openable(seen, neighbour)[:, None], axis=0
-    ).reshape(shape)
-    decisive = _diagonal(bucket) < _LEVEL_WEIGHT**2
+_LEVELS_PER_TRIP: Final[int] = 16
 
-    def spreads(carry: tuple[Array, Array]) -> Array:
-        distance, level = carry
-        going = active & (level < seen.radius) & jnp.any(distance == level)
+
+def _rows(cells: Array, bucket: BucketSpec) -> Array:
+    grid = cells.reshape(bucket.height, bucket.width).astype(jnp.uint32)
+    bits = jnp.left_shift(jnp.uint32(1), jnp.arange(bucket.width, dtype=jnp.uint32))
+    return jnp.sum(grid * bits, axis=-1, dtype=jnp.uint32)
+
+
+def _spread_rows(front: Array, bucket: BucketSpec) -> Array:
+    full = jnp.uint32((1 << bucket.width) - 1)
+    empty = jnp.zeros(1, jnp.uint32)
+    return (
+        (jnp.left_shift(front, jnp.uint32(1)) & full)
+        | jnp.right_shift(front, jnp.uint32(1))
+        | jnp.concatenate([empty, front[:-1]])
+        | jnp.concatenate([front[1:], empty])
+    )
+
+
+def _row_bit(rows: Array, cell: Array, bucket: BucketSpec) -> Array:
+    known = jnp.clip(cell, 0, bucket.cell_count - 1)
+    word = rows[known // bucket.width]
+    bit = jnp.right_shift(word, (known % bucket.width).astype(jnp.uint32)) & jnp.uint32(
+        1
+    )
+    return (cell != ABSENT) & (bit != 0)
+
+
+def _proximity(seen: _Seen, turn: _Turn, goal: Array, neighbour: Array, active: Array, bucket: BucketSpec) -> Array:
+    every = jnp.arange(bucket.cell_count, dtype=jnp.int32)
+    blocked = _rows(seen.wall | turn.taken | seen.occupied, bucket)
+    opening = _openable(seen, neighbour)
+    decisive = _diagonal(bucket) < _LEVEL_WEIGHT**2
+    radius = seen.radius
+
+    def spreads(carry: tuple[Array, Array, Array, Array]) -> Array:
+        front, _, near, level = carry
+        going = active & (level < radius) & jnp.any(front != 0)
         if decisive:
-            going = going & ~jnp.any(opening & (distance != _HIGHEST))
+            going = going & ~jnp.any(opening & (near != _HIGHEST))
         return going
 
-    def spread(carry: tuple[Array, Array]) -> tuple[Array, Array]:
-        distance, level = carry
-        padded = jnp.pad(distance == level, 1)
-        reached = (
-            padded[:-2, 1:-1] | padded[2:, 1:-1] | padded[1:-1, :-2] | padded[1:-1, 2:]
-        )
-        new = reached & ~blocked & (distance == _HIGHEST)
-        return jnp.where(new, level + 1, distance), level + 1
+    def spread(carry: tuple[Array, Array, Array, Array]) -> tuple[Array, Array, Array, Array]:
+        front, reached, near, level = carry
+        for step in range(_LEVELS_PER_TRIP):
+            on = active & (level + step < radius)
+            new = jnp.where(
+                on, _spread_rows(front, bucket) & ~blocked & ~reached, jnp.uint32(0)
+            )
+            reached = reached | new
+            near = jnp.where(
+                (near == _HIGHEST) & _row_bit(new, neighbour, bucket),
+                level + step + 1,
+                near,
+            )
+            front = new
+        return front, reached, near, level + _LEVELS_PER_TRIP
 
-    initial = jnp.where(every == goal, 0, _HIGHEST).reshape(shape)
-    distance, _ = lax.while_loop(spreads, spread, (initial, jnp.int32(0)))
-    return distance.reshape(-1)
+    initial = _rows(every == goal, bucket)
+    near = jnp.where(_row_bit(initial, neighbour, bucket), 0, _HIGHEST).astype(
+        jnp.int32
+    )
+    _, _, near, _ = lax.while_loop(
+        spreads, spread, (initial, initial, near, jnp.int32(0))
+    )
+    return near
 
 
 def _breadth_first_direction(seen: _Seen, turn: _Turn, start: Array, goal: Array, active: Array, bucket: BucketSpec) -> tuple[Array, Array]:
     neighbour = _neighbours(start, bucket)
-    distance = _proximity(seen, turn, goal, neighbour, active, bucket)
-    near = jnp.where(
-        neighbour != ABSENT, distance[jnp.clip(neighbour, 0, None)], _HIGHEST
-    )
+    near = _proximity(seen, turn, goal, neighbour, active, bucket)
     open_ = _openable(seen, neighbour) & (near != _HIGHEST)
     fit = -_LEVEL_WEIGHT * near - _floor_sqrt(_squared(neighbour, goal, bucket), bucket)
     best = jnp.argmax(jnp.where(open_, fit, _LOWEST))
     return jnp.asarray(_AROUND_DIRECTIONS, jnp.int32)[best], jnp.any(open_)
 
 
-def _move_towards(seen: _Seen, turn: _Turn, slot: Array, goal: Array, active: Array, bucket: BucketSpec) -> tuple[_Turn, Array]:
+def _plan_move(seen: _Seen, turn: _Turn, slot: Array, goal: Array, active: Array, bucket: BucketSpec) -> tuple[Array, Array, Array]:
     start = seen.cell[slot]
     free = seen.free & ~turn.taken
     path = pathfinding.search(
@@ -475,8 +511,17 @@ def _move_towards(seen: _Seen, turn: _Turn, slot: Array, goal: Array, active: Ar
     direction = jnp.where(reaches_open, toward, path.step)
     target = _step(start, direction, bucket)
     moved = stepped & _move_allowed(seen, target) & ~_at(turn.taken, target)
+    return direction, target, moved
+
+
+def _apply_move(seen: _Seen, turn: _Turn, slot: Array, direction: Array, target: Array, moved: Array) -> _Turn:
     turn = _issue(seen, turn, slot, moved, KIND_MOVE, direction=direction)
-    return _lock(turn, target, moved), moved
+    return _lock(turn, target, moved)
+
+
+def _move_towards(seen: _Seen, turn: _Turn, slot: Array, goal: Array, active: Array, bucket: BucketSpec) -> tuple[_Turn, Array]:
+    direction, target, moved = _plan_move(seen, turn, slot, goal, active, bucket)
+    return _apply_move(seen, turn, slot, direction, target, moved), moved
 
 
 def _shuffled_move(seen: _Seen, turn: _Turn, slot: Array, passing: Array, key: Array, bucket: BucketSpec) -> _Turn:
@@ -575,43 +620,48 @@ def _produce_first(seen: _Seen, turn: _Turn, slot: Array, directions: Array, pro
     )
 
 
-def _reachable(free: Array, start: Array, bucket: BucketSpec) -> Array:
-    grid = free.reshape(bucket.height, bucket.width)
+def _reachable(free: Array, start: Array, targets: Array, bucket: BucketSpec) -> Array:
     every = jnp.arange(bucket.cell_count, dtype=jnp.int32)
     seeds = jnp.zeros(bucket.cell_count, jnp.bool_)
     for dx, dy in DIRECTION_OFFSETS:
         beside = jnp.where(start == ABSENT, ABSENT, _offset_cell(start, dx, dy, bucket))
         seeds = seeds | ((beside != ABSENT) & (every == beside))
-    seeds = seeds.reshape(grid.shape) & grid
+    seeds = _rows(seeds, bucket) & free
 
     def spread(reached: Array) -> Array:
-        padded = jnp.pad(reached, 1)
-        return grid & (
-            reached
-            | padded[:-2, 1:-1]
-            | padded[2:, 1:-1]
-            | padded[1:-1, :-2]
-            | padded[1:-1, 2:]
-        )
+        return free & (reached | _spread_rows(reached, bucket))
+
+    def grow(carry: tuple[Array, Array]) -> tuple[Array, Array]:
+        reached, _ = carry
+        grown = reached
+        for _ in range(_LEVELS_PER_TRIP):
+            grown = spread(grown)
+        return grown, reached
 
     reached, _ = lax.while_loop(
-        lambda carry: jnp.any(carry[0] != carry[1]),
-        lambda carry: (spread(carry[0]), carry[0]),
+        lambda carry: jnp.any(carry[0] != carry[1]) & ~jnp.any(carry[0] & targets),
+        grow,
         (spread(seeds), seeds),
     )
-    return reached.reshape(-1)
+    return reached
 
 
 def _separated(seen: _Seen, turn: _Turn, slot: Array, active: Array, bucket: BucketSpec) -> Array:
     start = seen.cell[slot]
-    free = seen.free & ~turn.taken
-    reached = _reachable(free, jnp.where(active, start, ABSENT), bucket)
+    free = _rows(seen.free & ~turn.taken, bucket)
     beside = jnp.stack(
         [_offset_cell(seen.cell, dx, dy, bucket) for dx, dy in DIRECTION_OFFSETS]
     )
-    reaches = jnp.any((beside != ABSENT) & reached[jnp.clip(beside, 0, None)], axis=0)
     adjacent = _squared(start, seen.cell, bucket) <= 1
-    return ~jnp.any(seen.enemy & reaches & ~adjacent)
+    counted = (beside != ABSENT) & (seen.enemy & ~adjacent)[None, :]
+    targets = _rows(
+        jnp.zeros(bucket.cell_count, jnp.bool_)
+        .at[jnp.where(counted, beside, bucket.cell_count)]
+        .set(True, mode="drop"),
+        bucket,
+    )
+    reached = _reachable(free, jnp.where(active, start, ABSENT), targets, bucket)
+    return ~jnp.any(reached & targets)
 
 
 def _targets_tried(seen: _Seen, game: GameConfig) -> Array:
@@ -696,20 +746,21 @@ def _attack_nearby(seen: _Seen, turn: _Turn, slot: Array, real: Array, game: Gam
     chase_rank = jnp.cumsum(chases, dtype=jnp.int32) - 1
     chase_count = jnp.sum(chases, dtype=jnp.int32)
 
-    def chase(carry: tuple[Array, _Turn, Array]) -> tuple[Array, _Turn, Array]:
-        tried, turn, moved = carry
+    def chase(carry: tuple[Array, Array, Array, Array]) -> tuple[Array, Array, Array, Array]:
+        tried, moved, _, _ = carry
         target = order[jnp.argmax(chases & (chase_rank == tried))]
         active = ~moved & (tried < chase_count)
-        turn, moved = _move_towards(
+        direction, cell, moved = _plan_move(
             seen, turn, slot, seen.cell[target], active, game.bucket
         )
-        return tried + 1, turn, moved
+        return tried + 1, moved, direction, cell
 
-    _, turn, moved = lax.while_loop(
-        lambda carry: ~carry[2] & (carry[0] < chase_count),
+    _, moved, direction, cell = lax.while_loop(
+        lambda carry: ~carry[1] & (carry[0] < chase_count),
         chase,
-        (jnp.int32(0), turn, jnp.bool_(False)),
+        (jnp.int32(0), jnp.bool_(False), jnp.int32(ABSENT), jnp.int32(ABSENT)),
     )
+    turn = _apply_move(seen, turn, slot, direction, cell, moved)
     acts = ~moved & (first_decisive < limit)
     decisive_try = jnp.minimum(first_decisive, order.shape[0] - 1)
     target = order[decisive_try]
@@ -725,6 +776,23 @@ def _attack_nearby(seen: _Seen, turn: _Turn, slot: Array, real: Array, game: Gam
     )
     return _issue(
         seen, turn, slot, acts & waits[decisive_try], KIND_NONE, none_duration=_WAIT
+    )
+
+
+def _in_contact(seen: _Seen, game: GameConfig) -> Array:
+    bucket = game.bucket
+    capacity = bucket.per_player_capacity
+    cell = lax.dynamic_slice_in_dim(seen.cell, seen.start, capacity)[:, None]
+    unit_type = lax.dynamic_slice_in_dim(seen.unit_type, seen.start, capacity)[:, None]
+    squared = _squared(cell, seen.cell, bucket)
+    near = (
+        _within(unit_type, squared, game)
+        | _within(unit_type, _squared(cell, seen.future_cell, bucket), game)
+        | _within(seen.unit_type, squared, game)
+    )
+    touching = jnp.any(near & seen.enemy, axis=-1)
+    return lax.dynamic_update_slice_in_dim(
+        jnp.zeros_like(seen.mine), touching, seen.start, 0
     )
 
 
@@ -769,7 +837,13 @@ def _all_attack_nearby(seen: _Seen, turn: _Turn, game: GameConfig) -> _Turn:
     def visit(turn: _Turn, slot: Array, real: Array) -> _Turn:
         return _attack_nearby(seen, turn, slot, real, game)
 
-    return _each(_owned_in_unit_order(seen, seen.mine, capacity), turn, visit)
+    acting = (
+        seen.mine
+        & game.unit_can_attack[seen.unit_type]
+        & ~_busy_all(seen, turn)
+        & _in_contact(seen, game)
+    )
+    return _each(_owned_in_unit_order(seen, acting, capacity), turn, visit)
 
 
 def _needs_barracks(seen: _Seen, turn: _Turn, game: GameConfig) -> Array:
@@ -1213,18 +1287,16 @@ def _go_harvesting(seen: _Seen, turn: _Turn, slot: Array, active: Array, key: Ar
 def _harvest_score(seen: _Seen, turn: _Turn, bases: Array, game: GameConfig) -> Array:
     bucket = game.bucket
     busy = _busy_all(seen, turn)
-
-    def score(slot: Array) -> Array:
-        cell = seen.cell[slot]
-        resource = _closest(cell, seen.resource, seen, bucket)
-        base = _closest(cell, bases, seen, bucket)
-        total = _manhattan(
-            cell, seen.cell[jnp.clip(base, 0, None)], bucket
-        ) + _manhattan(cell, seen.cell[jnp.clip(resource, 0, None)], bucket)
-        return jnp.where((resource == ABSENT) | (base == ABSENT), _HIGHEST, total)
-
-    every = jnp.arange(seen.birth.shape[0], dtype=jnp.int32)
-    return jnp.where(busy | (seen.carried > 0), _HIGHEST, jax.vmap(score)(every))
+    to_resource = _distance_at(
+        _distance_field(_board(seen.resource, seen, bucket), bucket), seen.cell
+    )
+    to_base = _distance_at(
+        _distance_field(_board(bases, seen, bucket), bucket), seen.cell
+    )
+    missing = ~jnp.any(seen.resource) | ~jnp.any(bases)
+    return jnp.where(
+        busy | (seen.carried > 0) | missing, _HIGHEST, to_resource + to_base
+    )
 
 
 def _remembered_slots(seen: _Seen, harvesters: Harvesters) -> Array:
@@ -1340,7 +1412,8 @@ def _worker_action(seen: _Seen, turn: _Turn, key: Array, game: GameConfig) -> _T
         turn, _ = _move_towards(seen, turn, slot, goal, goes & ~beside, bucket)
         return turn
 
-    return _each(_owned_in_unit_order(seen, workers, capacity), turn, deliver)
+    delivering = workers & ~_busy_all(seen, turn) & (seen.carried > 0) & jnp.any(bases)
+    return _each(_owned_in_unit_order(seen, delivering, capacity), turn, deliver)
 
 
 def _workers_attack(seen: _Seen, turn: _Turn, game: GameConfig) -> Array:
@@ -1390,11 +1463,14 @@ def _go_combat(seen: _Seen, turn: _Turn, passes: tuple[Array, ...], key: Array, 
         order = jnp.lexsort(
             (seen.birth, -jnp.where(seen.enemy, score.astype(jnp.float32), -jnp.inf))
         )
-        limit = jnp.where(able, tried_at_most, 0)
+        beside = _neighbours(seen.cell[slot], bucket)
+        free = seen.free & ~turn.taken
+        boxed = ~jnp.any((beside != ABSENT) & free[jnp.clip(beside, 0, None)])
+        limit = jnp.where(able & ~boxed, tried_at_most, 0)
 
-        def attempt(carry: tuple[Array, _Turn, Array]) -> tuple[Array, _Turn, Array]:
-            index, turn, moved = carry
-            turn, moved = _move_towards(
+        def attempt(carry: tuple[Array, Array, Array, Array]) -> tuple[Array, Array, Array, Array]:
+            index, moved, _, _ = carry
+            direction, cell, moved = _plan_move(
                 seen,
                 turn,
                 slot,
@@ -1402,13 +1478,15 @@ def _go_combat(seen: _Seen, turn: _Turn, passes: tuple[Array, ...], key: Array, 
                 ~moved & (index < limit),
                 bucket,
             )
-            return index + jnp.where(moved, 0, 1), turn, moved
+            return index + jnp.where(moved, 0, 1), moved, direction, cell
 
-        tried, turn, _ = lax.while_loop(
-            lambda carry: ~carry[2] & (carry[0] < limit),
+        tried, moved, direction, cell = lax.while_loop(
+            lambda carry: ~carry[1] & (carry[0] < limit),
             attempt,
-            (jnp.int32(0), turn, jnp.bool_(False)),
+            (jnp.int32(0), jnp.bool_(False), jnp.int32(ABSENT), jnp.int32(ABSENT)),
         )
+        turn = _apply_move(seen, turn, slot, direction, cell, moved)
+        tried = jnp.where(able & boxed, tried_at_most, tried)
         stuck = (
             able & (candidates > 0) & (tried >= candidates) & (unit_type == TYPE_RANGED)
         )
@@ -1416,7 +1494,12 @@ def _go_combat(seen: _Seen, turn: _Turn, passes: tuple[Array, ...], key: Array, 
         nearest = seen.cell[order[0]]
         return _move_closer(seen, turn, slot, nearest, stuck, key, bucket)
 
-    return _each(_owned_in_pass_order(seen, passes, capacity), turn, visit)
+    able = ~_busy_all(seen, turn) & game.unit_can_attack[seen.unit_type]
+    return _each(
+        _owned_in_pass_order(seen, tuple(units & able for units in passes), capacity),
+        turn,
+        visit,
+    )
 
 
 def _free_blocks(seen: _Seen, turn: _Turn, workers: Array, key: Array, game: GameConfig) -> _Turn:
@@ -1428,7 +1511,9 @@ def _free_blocks(seen: _Seen, turn: _Turn, workers: Array, key: Array, game: Gam
         idle = real & ~_busy(seen, turn, slot) & crowded
         return _move_away(seen, turn, slot, idle, key, bucket)
 
-    return _each(_owned_in_unit_order(seen, workers, capacity), turn, visit)
+    crowded = jnp.any(_at(seen.occupied, _neighbours(seen.cell, bucket)), axis=0)
+    listed = workers & ~_busy_all(seen, turn) & crowded
+    return _each(_owned_in_unit_order(seen, listed, capacity), turn, visit)
 
 
 def _fill_with_nones(seen: _Seen, turn: _Turn, game: GameConfig) -> _Turn:
