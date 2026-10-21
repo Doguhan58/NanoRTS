@@ -43,6 +43,7 @@ def _process_start() -> float:
 PROCESS_START = _process_start()
 
 SELF_PLAY = "self-play"
+COSTLY_OPPONENTS = ("mayari", "tma")
 
 FEATURE_MAPS = (
     "hit_points",
@@ -823,6 +824,49 @@ def _seated_reset(environment: Any, roots: Array, seats: Array) -> tuple[Any, An
     )(roots, seats)
 
 
+class _Loop:
+    def __init__(self, mix: Any, members: Sequence[int], video_rows: np.ndarray) -> None:
+        self.bounds = mix.slices()
+        self.members = tuple(members)
+        self.whole = len(self.members) == len(self.bounds)
+        self.part = bots.GroupMix([mix.groups[index] for index in self.members])
+        self.layout = _RowLayout(self.part)
+        self.rows = np.concatenate(
+            [
+                np.arange(self.bounds[index].start, self.bounds[index].stop)
+                for index in self.members
+            ]
+        )
+        self.video_positions = np.flatnonzero(np.isin(video_rows, self.rows))
+        self.video_rows = np.searchsorted(
+            self.rows, video_rows[self.video_positions]
+        ).astype(np.int32)
+
+    def widened(self, own: Array, held: Array) -> Array:
+        if self.whole:
+            return own
+        pieces, taken = [], 0
+        for index, bound in enumerate(self.bounds):
+            if index in self.members:
+                size = bound.stop - bound.start
+                pieces.append(own[taken : taken + size])
+                taken += size
+            else:
+                pieces.append(held[bound])
+        return jnp.concatenate(pieces)
+
+    def narrowed(self, full: Array) -> Array:
+        if self.whole:
+            return full
+        return jnp.concatenate([full[self.bounds[index]] for index in self.members])
+
+
+def _ordered(positions: Sequence[np.ndarray], parts: Sequence[Array]) -> Array:
+    joined = jnp.concatenate(parts)
+    order = np.argsort(np.concatenate(positions))
+    return joined if np.array_equal(order, np.arange(order.size)) else joined[order]
+
+
 class Evaluation:
     def __init__(self, config: Config, *, roster: bool, videos: bool) -> None:
         self.config = config
@@ -849,9 +893,20 @@ class Evaluation:
         for opponent, rows in zip(opponents, mix.slices(), strict=True):
             starts.setdefault(opponent, rows.start)
         self.video_rows = np.asarray(list(starts.values()), np.int32)
+        costly = [
+            index
+            for index, opponent in enumerate(opponents)
+            if opponent in COSTLY_OPPONENTS
+        ]
+        rest = [index for index in range(len(opponents)) if index not in costly]
+        self.loops = tuple(
+            _Loop(mix, members, self.video_rows)
+            for members in [*([index] for index in costly), rest]
+            if members
+        )
 
     def play(self, params: Any, key: Array) -> tuple[Array, Array | None, Array]:
-        mix, cycles = self.layout.mix, self.config.max_cycles
+        mix = self.layout.mix
         key, environment_key = jax.random.split(key)
         roots = jax.random.split(environment_key, mix.lanes)
         lane_seats = jnp.asarray(self.lane_seats)
@@ -865,11 +920,34 @@ class Evaluation:
         start = jnp.concatenate(
             [observation.feature_maps for observation in observations]
         )
-        rows = jnp.asarray(self.video_rows)
+        held = (start, mix.get_slot_cells(states), mix.get_avail_actions(states))
+        finals = [self._played(loop, params, key, states, held) for loop in self.loops]
+        outcome = _ordered(
+            [loop.rows for loop in self.loops], [final.outcome for final in finals]
+        )
+        video_positions = [loop.video_positions for loop in self.loops]
+        frames = (
+            _ordered(video_positions, [final.frames for final in finals])
+            if self.videos
+            else None
+        )
+        lengths = _ordered(video_positions, [final.lengths for final in finals])
+        outcomes = outcome.reshape(
+            len(self.cases), self.config.eval_games, len(OUTCOMES)
+        )
+        return outcomes.sum(1, dtype=jnp.int32), frames, lengths
+
+    def _played(self, loop: _Loop, params: Any, key: Array, states: tuple[Any, ...], held: tuple[Array, Array, Array]) -> Any:
+        part, cycles = loop.part, self.config.max_cycles
+        held_maps, held_cells, held_masks = held
+        start = loop.narrowed(held_maps)
+        video_rows = jnp.asarray(loop.video_rows)
         frames = None
         if self.videos:
-            frames = jnp.zeros((len(rows), cycles + 1, *start.shape[1:]), start.dtype)
-            frames = frames.at[:, 0].set(start[rows])
+            frames = jnp.zeros(
+                (len(video_rows), cycles + 1, *start.shape[1:]), start.dtype
+            )
+            frames = frames.at[:, 0].set(start[video_rows])
 
         class Carry(NamedTuple):
             cycle: Array
@@ -886,52 +964,55 @@ class Evaluation:
 
         def cycle(carry: Carry) -> Carry:
             key, step_key = jax.random.split(carry.key)
-            step = _act(
-                self.layout,
+            step_key, sample_key = jax.random.split(step_key)
+            masks = part.get_avail_actions(carry.states)
+            decision = decide(
                 self.model,
                 params,
-                carry.states,
-                carry.maps,
-                step_key,
+                loop.widened(carry.maps, held_maps),
+                loop.widened(part.get_slot_cells(carry.states), held_cells),
+                loop.widened(masks, held_masks),
+                sample_key,
                 self.config.slot_limit,
             )
-            first = step.done & ~carry.ended
+            observations, following, _, done, infos = part.step(
+                step_key, carry.states, loop.narrowed(decision.actions)
+            )
+            players = loop.layout.players(carry.states)
+            first = done & ~carry.ended
             frames = carry.frames
             if frames is not None:
-                frame = step.infos["final_observation"].feature_maps[rows]
+                frame = infos["final_observation"].feature_maps[video_rows]
                 frames = jax.lax.dynamic_update_slice_in_dim(
                     frames, frame[:, None], carry.cycle + 1, axis=1
                 )
             return Carry(
                 cycle=carry.cycle + 1,
-                states=step.states,
-                maps=step.observations.feature_maps,
+                states=following,
+                maps=observations.feature_maps,
                 key=key,
-                outcome=carry.outcome
-                + _outcomes(first, step.infos["winner"], step.players),
-                ended=carry.ended | step.done,
-                lengths=jnp.where(carry.ended[rows], carry.lengths, carry.lengths + 1),
+                outcome=carry.outcome + _outcomes(first, infos["winner"], players),
+                ended=carry.ended | done,
+                lengths=jnp.where(
+                    carry.ended[video_rows], carry.lengths, carry.lengths + 1
+                ),
                 frames=frames,
             )
 
-        final = jax.lax.while_loop(
+        return jax.lax.while_loop(
             going,
             cycle,
             Carry(
                 cycle=jnp.int32(0),
-                states=states,
+                states=tuple(states[index] for index in loop.members),
                 maps=start,
                 key=key,
-                outcome=jnp.zeros((mix.rows, len(OUTCOMES)), jnp.int32),
-                ended=jnp.zeros(mix.rows, jnp.bool_),
-                lengths=jnp.zeros(len(rows), jnp.int32),
+                outcome=jnp.zeros((part.rows, len(OUTCOMES)), jnp.int32),
+                ended=jnp.zeros(part.rows, jnp.bool_),
+                lengths=jnp.zeros(len(video_rows), jnp.int32),
                 frames=frames,
             ),
         )
-        outcomes = final.outcome.reshape(
-            len(self.cases), self.config.eval_games, len(OUTCOMES)
-        )
-        return outcomes.sum(1, dtype=jnp.int32), final.frames, final.lengths
 
 
 class Trajectory(NamedTuple):
