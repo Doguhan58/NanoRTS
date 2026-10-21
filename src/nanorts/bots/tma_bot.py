@@ -140,6 +140,9 @@ _FREE_WORKERS: Final[int] = 4
 _IDLE_HARVESTERS: Final[int] = 5
 _SKIPPED: Final[int] = 6
 
+_FIRST_PASS_PHASE: Final[str] = "first_pass"
+_WORKER_PHASE: Final[str] = "workers"
+
 
 class MacroMemory(NamedTuple):
     initialized: Array
@@ -180,6 +183,8 @@ class _Seen(NamedTuple):
     reserved: Array
     balance: Array
     time: Array
+    rank: Array
+    by_rank: Array
 
 
 class _Strategy(NamedTuple):
@@ -294,14 +299,23 @@ def _adjacent_direction(cell: Array, goal: Array, width: int) -> Array:
     return jnp.where(found, jnp.argmax(matches), ABSENT).astype(jnp.int32)
 
 
-def _least(score: Array, among: Array, seen: _Seen) -> tuple[Array, Array]:
-    masked = jnp.where(among, score, _HIGHEST)
-    least = jnp.min(masked)
-    first = jnp.argmin(jnp.where(among & (masked == least), seen.birth, _HIGHEST))
-    found = jnp.any(among)
+def _least(score: Array, among: Array, seen: _Seen, packed: bool = True) -> tuple[Array, Array]:
+    if not packed:
+        masked = jnp.where(among, score, _HIGHEST)
+        least = jnp.min(masked)
+        first = jnp.argmin(jnp.where(among & (masked == least), seen.birth, _HIGHEST))
+        found = jnp.any(among)
+        return (
+            jnp.where(found, first, ABSENT).astype(jnp.int32),
+            jnp.where(found, least, 0).astype(jnp.int32),
+        )
+    entities = seen.rank.shape[0]
+    least = jnp.min(jnp.where(among, score * entities + seen.rank, _HIGHEST))
+    found = least != _HIGHEST
+    first = seen.by_rank[jnp.where(found, least % entities, 0)]
     return (
         jnp.where(found, first, ABSENT).astype(jnp.int32),
-        jnp.where(found, least, 0).astype(jnp.int32),
+        jnp.where(found, least // entities, 0).astype(jnp.int32),
     )
 
 
@@ -388,6 +402,11 @@ def _read(state: State, game: GameConfig, player: Array | int) -> _Seen:
     wall = game.terrain.reshape(-1)
     resource_at = _cells_of(resource, cell, bucket)
     chokepoint = _chokepoints(wall, bucket)
+    slots = jnp.arange(bucket.entity_capacity, dtype=jnp.int32)
+    _, by_rank = lax.sort(
+        (jnp.where(present, state.birth, _HIGHEST), slots), num_keys=2, is_stable=False
+    )
+    rank = jnp.zeros_like(slots).at[by_rank].set(slots, unique_indices=True)
     return _Seen(
         player=player,
         first_owned=bucket.neutral_capacity + player * bucket.per_player_capacity,
@@ -420,6 +439,8 @@ def _read(state: State, game: GameConfig, player: Array | int) -> _Seen:
         reserved=reserved,
         balance=state.player_resources,
         time=state.time,
+        rank=rank,
+        by_rank=by_rank,
     )
 
 
@@ -475,12 +496,12 @@ def _reaches(free: Array, start: Array, goal: Array, active: Array, bucket: Buck
     return path._replace(found=active & path.found)
 
 
-def _real_distance(seen: _Seen, main: Array, game: GameConfig) -> Array:
+def _real_distance(seen: _Seen, main: Array, needed: Array, game: GameConfig) -> Array:
     bucket = game.bucket
     capacity = bucket.per_player_capacity
     first = bucket.neutral_capacity + (1 - seen.player) * capacity
     slots = first + jnp.arange(capacity, dtype=jnp.int32)
-    cells, enemy = seen.cell[slots], seen.enemy[slots]
+    cells, enemy = seen.cell[slots], seen.enemy[slots] & needed
     if not pathfinding.fits_kernel(bucket):
         return _bounded_distance(seen.free, main, cells, enemy, bucket)
     kernel, program = _distance_stages(bucket)
@@ -512,7 +533,8 @@ def _measured_distance(free: Array, main: Array, cells: Array, enemy: Array, buc
 
 
 def _bounded_distance(free: Array, main: Array, cells: Array, enemy: Array, bucket: BucketSpec) -> Array:
-    bounds = _bounds(_levels(free, main, bucket), cells, enemy, bucket)
+    origin = jnp.where(jnp.any(enemy), main, ABSENT)
+    bounds = _bounds(_levels(free, origin, bucket), cells, enemy, bucket)
     order = jnp.argsort(bounds)
     ordered = jnp.append(bounds[order], _HIGHEST)
     last = cells.shape[0] - 1
@@ -623,7 +645,7 @@ def _threshold(real_distance: Array, own: Array, bucket: BucketSpec) -> Array:
     ).astype(jnp.int32)
 
 
-def _macro(memory: MacroMemory, seen: _Seen, game: GameConfig) -> tuple[MacroMemory, _Strategy]:
+def _macro(memory: MacroMemory, seen: _Seen, plays: Array, game: GameConfig) -> tuple[MacroMemory, _Strategy]:
     bucket = game.bucket
     width = bucket.width
     own = _tally(seen.mine, seen)
@@ -633,9 +655,10 @@ def _macro(memory: MacroMemory, seen: _Seen, game: GameConfig) -> tuple[MacroMem
     weighted = jnp.where(recalibrates, _weighs(own), memory.weighted)
     main, enemy_base = memory.main_base, memory.enemy_base
     based = main != ABSENT
+    measures = based & (memory.real_base_to_enemy <= 0)
     real_distance = lax.cond(
-        based & (memory.real_base_to_enemy <= 0),
-        lambda: _real_distance(seen, jnp.clip(main, 0, None), game),
+        measures,
+        lambda: _real_distance(seen, jnp.clip(main, 0, None), measures & plays, game),
         lambda: memory.real_base_to_enemy,
     )
     base_to_enemy_base = jnp.where(
@@ -674,6 +697,9 @@ def _macro(memory: MacroMemory, seen: _Seen, game: GameConfig) -> tuple[MacroMem
         jnp.minimum(to_enemy, bucket.height + bucket.width) - _ENEMY_REACH,
     )
     military = weight * (spare + _BARRACKS_WEIGHT * holds_barracks + nearness) >= 0
+    consulted = military & jnp.any(
+        seen.mine & seen.available & (seen.unit_type == TYPE_BARRACKS)
+    )
     cut_off = lax.cond(
         based & (nearest != ABSENT),
         lambda: (
@@ -681,7 +707,7 @@ def _macro(memory: MacroMemory, seen: _Seen, game: GameConfig) -> tuple[MacroMem
                 seen.free,
                 jnp.clip(main, 0, None),
                 _cell_of(nearest, seen),
-                jnp.bool_(True),
+                consulted,
                 bucket,
             ).found
         ),
@@ -881,14 +907,15 @@ def _approach(seen: _Seen, searched: Array, slot: Array, target: Array, active: 
 
     def try_next(carry: tuple[Array, Array]) -> tuple[Array, Array]:
         index, _ = carry
-        path = pathfinding.search(free, start, candidates[index], jnp.int32(0), bucket)
+        goal = jnp.where(unanswered(carry), candidates[index], start)
+        path = pathfinding.search(free, start, goal, jnp.int32(0), bucket)
         return index + 1, path.step
 
     _, step = lax.while_loop(unanswered, try_next, (jnp.int32(0), jnp.int32(ABSENT)))
     return _walk(seen, start, step, bucket)
 
 
-def _carry_out(seen: _Seen, searched: Array, slot: Array, plan: _Plan, strategy: _Strategy, active: Array, game: GameConfig) -> _Desire:
+def _carry_out(seen: _Seen, searched: Array, slot: Array, plan: _Plan, strategy: _Strategy, active: Array, game: GameConfig, phase: str) -> _Desire:
     bucket = game.bucket
     width = bucket.width
     start = seen.cell[slot]
@@ -907,21 +934,29 @@ def _carry_out(seen: _Seen, searched: Array, slot: Array, plan: _Plan, strategy:
         & (_squared(start, seen.future_cell[target], width) <= reach * reach)
     )
     chases = engages & ~strikes & ~waits
-    carrying = seen.carried[slot] > 0
-    errand = jnp.where(carrying, plan.base, plan.target)
-    harvests = (plan.mode == _HARVEST) & (errand != ABSENT)
-    builds = plan.mode == _BUILD
-    moves = plan.mode == _MOVE
-    searching = active & (chases | harvests | builds | moves)
-    goal = jnp.select(
-        [chases, harvests], [target_cell, _cell_of(errand, seen)], plan.cell
-    )
-    radius = jnp.select([chases, harvests | builds], [reach, 1], 0).astype(jnp.int32)
-    free = jnp.where(
-        chases & plan.scouting,
-        _scout_free(seen, searched),
-        _astar_free(seen, searched),
-    )
+    if phase == _FIRST_PASS_PHASE:
+        moves = plan.mode == _MOVE
+        searching = active & (chases | moves)
+        goal = jnp.where(chases, target_cell, plan.cell)
+        radius = jnp.where(chases, reach, 0).astype(jnp.int32)
+        free = _astar_free(seen, searched)
+    else:
+        carrying = seen.carried[slot] > 0
+        errand = jnp.where(carrying, plan.base, plan.target)
+        harvests = (plan.mode == _HARVEST) & (errand != ABSENT)
+        builds = plan.mode == _BUILD
+        searching = active & (chases | harvests | builds)
+        goal = jnp.select(
+            [chases, harvests], [target_cell, _cell_of(errand, seen)], plan.cell
+        )
+        radius = jnp.select([chases, harvests | builds], [reach, 1], 0).astype(
+            jnp.int32
+        )
+        free = jnp.where(
+            chases & plan.scouting,
+            _scout_free(seen, searched),
+            _astar_free(seen, searched),
+        )
     path = pathfinding.search(
         free,
         start,
@@ -931,13 +966,24 @@ def _carry_out(seen: _Seen, searched: Array, slot: Array, plan: _Plan, strategy:
     )
     stepped = searching & (path.step != ABSENT)
     walks = _walk(seen, start, path.step, bucket)
+    approach = _approach(seen, searched, slot, target, active & chases & ~stepped, game)
+    if phase == _FIRST_PASS_PHASE:
+        desire = _choose(
+            plan.mode == _TRAIN,
+            _train(seen, slot, plan.unit_type, strategy, game),
+            _nothing(),
+        )
+        desire = _choose(strikes, _attack(target_cell), desire)
+        desire = _choose(waits, _wait_one(), desire)
+        desire = _choose(chases & stepped, walks, desire)
+        desire = _choose(chases & ~stepped, approach, desire)
+        return _choose(moves & stepped, walks, desire)
     into_resource = plan.scouting & _at(
         seen.resource_at, _step(start, path.step, bucket)
     )
     gathers = _choose(
         _stalls(seen, slot, width), _nothing(), _directed(KIND_HARVEST, path.step)
     )
-    approach = _approach(seen, searched, slot, target, active & chases & ~stepped, game)
     beside = _adjacent_direction(start, goal, width)
     errand_end = _choose(
         beside != ABSENT,
@@ -953,15 +999,11 @@ def _carry_out(seen: _Seen, searched: Array, slot: Array, plan: _Plan, strategy:
         _produced(beside, plan.unit_type),
         _nothing(),
     )
-    desire = _nothing()
-    desire = _choose(
-        plan.mode == _TRAIN, _train(seen, slot, plan.unit_type, strategy, game), desire
-    )
-    desire = _choose(strikes, _attack(target_cell), desire)
+    desire = _choose(strikes, _attack(target_cell), _nothing())
     desire = _choose(waits, _wait_one(), desire)
     desire = _choose(chases & stepped, _choose(into_resource, gathers, walks), desire)
     desire = _choose(chases & ~stepped, approach, desire)
-    desire = _choose((harvests | builds | moves) & stepped, walks, desire)
+    desire = _choose((harvests | builds) & stepped, walks, desire)
     desire = _choose(harvests & ~stepped, errand_end, desire)
     desire = _choose(builds & ~stepped, site_end, desire)
     return _choose(plan.mode == _IDLE, _idle(seen, slot, game), desire)
@@ -1131,11 +1173,11 @@ def _builder_plan(seen: _Seen, slot: Array, strategy: _Strategy, game: GameConfi
     return plan, ~places_base & ~places_barracks & scouts
 
 
-def _errand(seen: _Seen, slot: Array, game: GameConfig) -> _Errand:
+def _errand(seen: _Seen, slot: Array, game: GameConfig, packed: bool = True) -> _Errand:
     distance = _manhattan(seen.cell[slot], seen.cell, game.bucket.width)
-    resource, _ = _least(distance, seen.resource, seen)
-    base, to_base = _least(distance, seen.stockpile, seen)
-    enemy, to_enemy = _least(distance, seen.enemy, seen)
+    resource, _ = _least(distance, seen.resource, seen, packed)
+    base, to_base = _least(distance, seen.stockpile, seen, packed)
+    enemy, to_enemy = _least(distance, seen.enemy, seen, packed)
     attacks = (enemy != ABSENT) & (to_enemy <= _NEAR) & (to_base <= _NEAR)
     harvests = ~attacks & (resource != ABSENT) & (base != ABSENT)
     returns = ~attacks & ~harvests & (base != ABSENT) & (seen.carried[slot] > 0)
@@ -1229,7 +1271,7 @@ def _barracks_type(strategy: _Strategy) -> Array:
     return jnp.where(strategy.military, preferred, TYPE_LIGHT)
 
 
-def _role_plan(seen: _Seen, slot: Array, role: Array, strategy: _Strategy, game: GameConfig) -> _RolePlan:
+def _role_plan(seen: _Seen, slot: Array, role: Array, strategy: _Strategy, game: GameConfig, phase: str) -> _RolePlan:
     balance = seen.balance[seen.player]
     affords_worker = balance >= game.unit_cost[TYPE_WORKER]
     keeps_training = (strategy.own[_WORKERS] < strategy.harvesters) | (
@@ -1263,9 +1305,13 @@ def _role_plan(seen: _Seen, slot: Array, role: Array, strategy: _Strategy, game:
     def free(_: None) -> _RolePlan:
         return _RolePlan(_plan(_NOTHING), yes, yes)
 
+    if phase == _FIRST_PASS_PHASE:
+        return lax.switch(
+            jnp.clip(role, _BASE_ROLE, _FIGHTER_ROLE), [base, barracks, fighter], None
+        )
     return lax.switch(
-        jnp.clip(role, 0, _FREE_ROLE),
-        [base, barracks, fighter, builder, harvester, free],
+        jnp.clip(role - _BUILDER_ROLE, 0, _FREE_ROLE - _BUILDER_ROLE),
+        [builder, harvester, free],
         None,
     )
 
@@ -1315,7 +1361,7 @@ def _entries(seen: _Seen, strategy: _Strategy, game: GameConfig) -> _Entry:
         workers & (rank >= first_harvester) & (rank < first_free) & ~barracks_builder
     )
     free = workers & (rank >= first_free) & ~barracks_builder
-    errands = jax.vmap(lambda slot: _errand(seen, slot, game))(slots)
+    errands = jax.vmap(lambda slot: _errand(seen, slot, game, packed=False))(slots)
     idle_harvester = harvester & ~(errands.attacks | errands.harvests | errands.returns)
     group = jnp.select(
         [
@@ -1395,27 +1441,31 @@ def _accept(seen: _Seen, turn: _Turn, slot: Array, desire: _Desire, first_phase:
     )
 
 
-def _visit(seen: _Seen, strategy: _Strategy, turn: _Turn, entry: _Entry, active: Array, game: GameConfig) -> _Turn:
+def _visit(seen: _Seen, strategy: _Strategy, turn: _Turn, entry: _Entry, active: Array, game: GameConfig, phase: str) -> _Turn:
     bucket = game.bucket
     capacity = bucket.per_player_capacity
     slot = entry.slot
-    first_phase = entry.role <= _FIGHTER_ROLE
-    role_plan = _role_plan(seen, slot, entry.role, strategy, game)
+    role_plan = _role_plan(seen, slot, entry.role, strategy, game, phase)
+    if phase == _FIRST_PASS_PHASE:
+        desire = _carry_out(
+            seen, turn.searched, slot, role_plan.plan, strategy, active, game, phase
+        )
+        return _accept(seen, turn, slot, desire, jnp.bool_(True), active, game)
     scouts = role_plan.scouts
     scout = _scout_plan(seen, turn.searched, slot, strategy, scouts & active, game)
     plan = _choose(scouts, scout, role_plan.plan)
-    desire = _carry_out(seen, turn.searched, slot, plan, strategy, active, game)
+    desire = _carry_out(seen, turn.searched, slot, plan, strategy, active, game, phase)
     conflicts = (
         role_plan.checks_conflicts
         & (desire.kind == KIND_MOVE)
         & _beside_listed_move(seen, turn, slot, bucket)
     )
     desire = _choose(conflicts, _idle(seen, slot, game), desire)
-    listed = active & ~first_phase & (jnp.arange(capacity) == slot - seen.first_owned)
+    listed = active & (jnp.arange(capacity) == slot - seen.first_owned)
     turn = turn._replace(
         listed_move=jnp.where(listed, desire.kind == KIND_MOVE, turn.listed_move)
     )
-    return _accept(seen, turn, slot, desire, first_phase, active, game)
+    return _accept(seen, turn, slot, desire, jnp.bool_(False), active, game)
 
 
 def _fill(seen: _Seen, turn: _Turn, capacity: int) -> _Turn:
@@ -1458,21 +1508,29 @@ def _turn(seen: _Seen, strategy: _Strategy, game: GameConfig) -> _Turn:
 
     entries = _entries(seen, strategy, game)
     count = _visit_count(entries)
+    first_pass_end = jnp.sum(
+        entries.visits & (entries.role <= _FIGHTER_ROLE), dtype=jnp.int32
+    )
 
-    def walking(walk: tuple[Array, _Turn]) -> Array:
-        index, _ = walk
-        return index < count
+    def walk_phase(phase: str, begin: Array, end: Array, turn: _Turn) -> _Turn:
+        def walking(walk: tuple[Array, _Turn]) -> Array:
+            index, _ = walk
+            return index < end
 
-    def visit(walk: tuple[Array, _Turn]) -> tuple[Array, _Turn]:
-        index, turn = walk
-        entry = jax.tree.map(
-            lambda leaf: lax.dynamic_index_in_dim(leaf, index, keepdims=False),
-            entries,
-        )
-        active = (index < count) & entry.visits
-        return index + 1, _visit(seen, strategy, turn, entry, active, game)
+        def visit(walk: tuple[Array, _Turn]) -> tuple[Array, _Turn]:
+            index, turn = walk
+            entry = jax.tree.map(
+                lambda leaf: lax.dynamic_index_in_dim(leaf, index, keepdims=False),
+                entries,
+            )
+            active = (index < end) & entry.visits
+            return index + 1, _visit(seen, strategy, turn, entry, active, game, phase)
 
-    _, turn = lax.while_loop(walking, visit, (jnp.int32(0), turn))
+        _, turn = lax.while_loop(walking, visit, (begin, turn))
+        return turn
+
+    turn = walk_phase(_FIRST_PASS_PHASE, jnp.int32(0), first_pass_end, turn)
+    turn = walk_phase(_WORKER_PHASE, first_pass_end, count, turn)
     return _fill(seen, turn, capacity)
 
 
@@ -1506,14 +1564,16 @@ def _act(key: Array, memory: MacroMemory, state: State, game: GameConfig, player
     seen = _read(state, game, player)
     memory = _initialize(memory, seen)
 
+    plays = jnp.any(seen.mine & seen.available)
+
     def play(memory: MacroMemory) -> tuple[MacroMemory, Commands]:
-        memory, strategy = _macro(memory, seen, game)
+        memory, strategy = _macro(memory, seen, plays, game)
         return memory, _commands(_turn(seen, strategy, game), player, game)
 
     def pass_turn(memory: MacroMemory) -> tuple[MacroMemory, Commands]:
         return memory, empty(Commands, game.bucket)
 
-    return lax.cond(jnp.any(seen.mine & seen.available), play, pass_turn, memory)
+    return lax.cond(plays, play, pass_turn, memory)
 
 
 tma: Final[Bot[MacroMemory]] = Bot(name="tma", init=_init, act=_act)
