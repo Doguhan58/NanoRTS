@@ -51,6 +51,8 @@ class JaxMARLLayout:
 
     reward_components: bool
 
+    final_observation: bool
+
     @property
     def agents(self) -> tuple[str, ...]:
         return AGENTS
@@ -65,12 +67,13 @@ class JaxMARLLayout:
         return (self.bucket.per_player_capacity, width)
 
 
-def prepare(game: GameConfig, *, surface: str = "symbolic", partial_observability: bool = False, assets: rendering.RenderAssets | None = None, feature_dtype: DTypeLike | None = None, mask_form: str = "rows", reward_components: bool = False) -> JaxMARLLayout:
+def prepare(game: GameConfig, *, surface: str = "symbolic", partial_observability: bool = False, assets: rendering.RenderAssets | None = None, feature_dtype: DTypeLike | None = None, mask_form: str = "rows", reward_components: bool = False, final_observation: bool = True) -> JaxMARLLayout:
     _refuse_unknown_surface(surface)
     _refuse_assets("jaxmarl.prepare", surface, assets)
     _refuse_feature_dtype_without_feature_map(surface, feature_dtype)
     factors.refuse_mask_form("jaxmarl.prepare", mask_form, game.bucket)
-    _refuse_reward_components(reward_components)
+    _refuse_program_flag("reward_components", reward_components)
+    _refuse_program_flag("final_observation", final_observation)
     layout = _observation_layout(
         game, surface, assets, partial_observability, feature_dtype
     )
@@ -87,6 +90,7 @@ def prepare(game: GameConfig, *, surface: str = "symbolic", partial_observabilit
         mask_width=sum(widths),
         mask_form=mask_form,
         reward_components=reward_components,
+        final_observation=final_observation,
     )
 
 
@@ -112,11 +116,11 @@ def _refuse_feature_dtype_without_feature_map(surface: str, feature_dtype: DType
         )
 
 
-def _refuse_reward_components(reward_components: bool) -> None:
-    if not isinstance(reward_components, bool):
+def _refuse_program_flag(name: str, value: bool) -> None:
+    if not isinstance(value, bool):
         raise ModelError(
-            f"jaxmarl.prepare refuses reward_components={reward_components!r}: it "
-            "must be a bool, because it selects the compiled programs"
+            f"jaxmarl.prepare refuses {name}={value!r}: it must be a bool, "
+            "because it selects the compiled programs"
         )
 
 

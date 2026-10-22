@@ -45,15 +45,13 @@ constexpr int kCommandTargetCell = 3;
 constexpr int kCommandProducedType = 4;
 constexpr int kCommandRequestOrder = 5;
 
-constexpr int kAvailable = 0;
-constexpr int kKind = 1;
-constexpr int kMoveDirection = 2;
-constexpr int kHarvestDirection = 3;
-constexpr int kReturnDirection = 4;
-constexpr int kProduceDirection = 5;
-constexpr int kProduceType = 6;
-constexpr int kAttackOffset = 7;
-constexpr int kLegalityLeaves = 8;
+constexpr int32_t kWordBits = 32;
+constexpr int32_t kKinds = 6;
+constexpr int32_t kMoveColumn = kKinds;
+constexpr int32_t kHarvestColumn = kMoveColumn + kDirections;
+constexpr int32_t kReturnColumn = kHarvestColumn + kDirections;
+constexpr int32_t kProduceDirectionColumn = kReturnColumn + kDirections;
+constexpr int32_t kProduceTypeColumn = kProduceDirectionColumn + kDirections;
 
 constexpr int kOffsetAxes = 2;
 
@@ -66,7 +64,7 @@ constexpr int64_t shared_bytes(int64_t cells, int64_t capacity) {
 }
 
 struct Window {
-    int32_t kinds;
+    int32_t words;
     int32_t offsets;
     int32_t candidates;
 };
@@ -76,7 +74,7 @@ struct Inputs {
     StateRows<Slot, Cell> state;
     Lanes<int32_t> table;
     Lanes<int32_t> player;
-    Lanes<bool> legality[kLegalityLeaves];
+    Lanes<uint32_t> legality;
     Lanes<uint32_t> key;
     Lanes<float> log_weight;
     Lanes<int32_t> offsets;
@@ -160,6 +158,10 @@ __device__ unsigned long long max_key(float score, int32_t slot) {
     return static_cast<unsigned long long>(ordered) << 32 | (0xffffffffu - static_cast<uint32_t>(slot));
 }
 
+__device__ bool is_set(const uint32_t* row, int32_t column) {
+    return (row[column / kWordBits] >> (column % kWordBits) & 1u) != 0u;
+}
+
 template <typename Slot, typename Cell>
 struct Lane {
     const int32_t* birth;
@@ -169,7 +171,7 @@ struct Lane {
     const int8_t* pending_produced_type;
     const int32_t* resources;
     const int32_t* table;
-    const bool* legality[kLegalityLeaves];
+    const uint32_t* legality;
     draw::Key key;
     const float* log_weight;
     const int32_t* offsets;
@@ -178,11 +180,7 @@ struct Lane {
     int32_t other;
     Extents size;
 
-    __device__ Lane(const Inputs<Slot, Cell>& in, int64_t lane, const Extents& extents) : birth(in.state.birth.at(lane)), cell(in.state.cell.at(lane)), pending_kind(in.state.pending_kind.at(lane)), pending_direction(in.state.pending_direction.at(lane)), pending_produced_type(in.state.pending_produced_type.at(lane)), resources(in.state.resources.at(lane)), table(in.table.at(lane)), key{in.key.at(lane)[0], in.key.at(lane)[1]}, log_weight(in.log_weight.at(lane)), offsets(in.offsets.at(lane)), player(in.player.at(lane)[0]), own(gathered(player, nanorts::whole_act::kPlayers)), other(gathered(1 - player, nanorts::whole_act::kPlayers)), size(extents) {
-        for (int k = 0; k < kLegalityLeaves; ++k) {
-            legality[k] = in.legality[k].at(lane);
-        }
-    }
+    __device__ Lane(const Inputs<Slot, Cell>& in, int64_t lane, const Extents& extents) : birth(in.state.birth.at(lane)), cell(in.state.cell.at(lane)), pending_kind(in.state.pending_kind.at(lane)), pending_direction(in.state.pending_direction.at(lane)), pending_produced_type(in.state.pending_produced_type.at(lane)), resources(in.state.resources.at(lane)), table(in.table.at(lane)), legality(in.legality.at(lane)), key{in.key.at(lane)[0], in.key.at(lane)[1]}, log_weight(in.log_weight.at(lane)), offsets(in.offsets.at(lane)), player(in.player.at(lane)[0]), own(gathered(player, nanorts::whole_act::kPlayers)), other(gathered(1 - player, nanorts::whole_act::kPlayers)), size(extents) {}
 
     __device__ int32_t cost(int32_t type) const {
         return table[clip(type, 0, size.types - 1) * kTableColumns + kCost];
@@ -192,8 +190,13 @@ struct Lane {
         return size.neutral + own * size.capacity + local;
     }
 
-    __device__ const bool* row(int leaf, int32_t local, int32_t width) const {
-        return legality[leaf] + (static_cast<int64_t>(own) * size.capacity + local) * width;
+    __device__ bool available(int32_t local) const {
+        const int32_t slot = own_slot(local);
+        return birth[slot] != kAbsent && pending_kind[slot] == kKindAbsent;
+    }
+
+    __device__ const uint32_t* row(int32_t local, int32_t words) const {
+        return legality + (static_cast<int64_t>(own) * size.capacity + local) * words;
     }
 };
 
@@ -257,13 +260,8 @@ __device__ void mark_pending_claims(const Lane<Slot, Cell>& lane, const Shared& 
 template <typename Slot, typename Cell>
 __device__ int32_t drawn_candidate(const Lane<Slot, Cell>& lane, draw::Key key, uint32_t first, int32_t local, const Window& window) {
     const int32_t types = lane.size.types;
-    const bool* attack = lane.row(kAttackOffset, local, window.offsets);
-    const bool* harvest = lane.row(kHarvestDirection, local, kDirections);
-    const bool* returns = lane.row(kReturnDirection, local, kDirections);
-    const bool* produce_direction = lane.row(kProduceDirection, local, kDirections);
-    const bool* produce_type = lane.row(kProduceType, local, types);
-    const bool* move = lane.row(kMoveDirection, local, kDirections);
-    const bool* kind = lane.row(kKind, local, window.kinds);
+    const int32_t attack_column = kProduceTypeColumn + types;
+    const uint32_t* row = lane.row(local, window.words);
     draw::Best best;
     int32_t index = 0;
     const auto offer = [&](bool marked) {
@@ -275,28 +273,28 @@ __device__ int32_t drawn_candidate(const Lane<Slot, Cell>& lane, draw::Key key, 
     };
 
     for (int32_t offset = 0; offset < window.offsets; ++offset) {
-        offer(attack[offset]);
+        offer(is_set(row, attack_column + offset));
     }
 
     for (int32_t direction = 0; direction < kDirections; ++direction) {
-        offer(harvest[direction]);
+        offer(is_set(row, kHarvestColumn + direction));
     }
 
     for (int32_t direction = 0; direction < kDirections; ++direction) {
-        offer(returns[direction]);
+        offer(is_set(row, kReturnColumn + direction));
     }
 
     for (int32_t direction = 0; direction < kDirections; ++direction) {
         for (int32_t type = 0; type < types; ++type) {
-            offer(produce_direction[direction] && produce_type[type]);
+            offer(is_set(row, kProduceDirectionColumn + direction) && is_set(row, kProduceTypeColumn + type));
         }
     }
 
     for (int32_t direction = 0; direction < kDirections; ++direction) {
-        offer(move[direction]);
+        offer(is_set(row, kMoveColumn + direction));
     }
 
-    offer(kind[kKindNone]);
+    offer(is_set(row, kKindNone));
     return best.index;
 }
 
@@ -390,7 +388,7 @@ __device__ void act_on_every_unit(const Lane<Slot, Cell>& lane, const Shared& sh
     Choice choice;
 
     if (owns) {
-        available = lane.row(kAvailable, local, 1)[0];
+        available = lane.available(local);
         birth = lane.birth[lane.own_slot(local)];
         const int32_t index = drawn_candidate(lane, lane.key, static_cast<uint32_t>(local) * static_cast<uint32_t>(window.candidates), local, window);
         choice = chosen(lane, index, static_cast<int32_t>(lane.cell[lane.own_slot(local)]), window);
@@ -467,7 +465,7 @@ __device__ void act_on_one_unit(const Lane<Slot, Cell>& lane, const Shared& shar
     int32_t birth = kAbsent;
 
     if (owns) {
-        available = lane.row(kAvailable, local, 1)[0];
+        available = lane.available(local);
         birth = lane.birth[lane.own_slot(local)];
         const draw::Key unit_key = draw::split(lane.key, kUnitStream);
         const float score = available ? draw::score(unit_key, static_cast<uint32_t>(local), 0.0f) : draw::kUnmarked;
@@ -544,12 +542,9 @@ ffi::Error launch(cudaStream_t stream, nanorts::whole_act::Operands& operands, i
     }
 
     const int64_t rows = int64_t{nanorts::whole_act::kPlayers} * size.capacity;
-    const int64_t widths[kLegalityLeaves] = {1, window.kinds, kDirections, kDirections, kDirections, kDirections, size.types, window.offsets};
 
-    for (int k = 0; k < kLegalityLeaves; ++k) {
-        if (auto e = operands.next(rows * widths[k], in.legality[k]); e.failure()) {
-            return e;
-        }
+    if (auto e = operands.next(rows * window.words, in.legality); e.failure()) {
+        return e;
     }
 
     if (auto e = operands.next(int64_t{2}, in.key); e.failure()) {
@@ -566,38 +561,31 @@ ffi::Error launch(cudaStream_t stream, nanorts::whole_act::Operands& operands, i
 
     const int threads = nanorts::whole_act::threads_for(size.capacity);
     const int64_t shared = shared_bytes(size.cells, size.capacity);
+    static nanorts::whole_act::SharedOptIn opt_in;
+
+    if (auto e = opt_in.allow(operands, nanorts::kernel(act_kernel<Slot, Cell>), shared); e.failure()) {
+        return e;
+    }
+
     act_kernel<Slot, Cell><<<static_cast<unsigned>(lanes), threads, static_cast<size_t>(shared), stream>>>(in, commands, size, window, static_cast<int32_t>(units));
     return nanorts::launched();
 }
 
 constexpr int64_t kLegalityOperand = nanorts::whole_act::kStateOperands + 2;
-constexpr int64_t kKeyOperand = kLegalityOperand + kLegalityLeaves;
+constexpr int64_t kKeyOperand = kLegalityOperand + 1;
 constexpr int64_t kLogWeightOperand = kKeyOperand + 1;
 constexpr int64_t kOffsetsOperand = kLogWeightOperand + 1;
 constexpr int64_t kReadOperands = kOffsetsOperand + 1;
 
 ffi::Error check_extras(const nanorts::whole_act::Operands& operands, int64_t capacity, int64_t types, Window& window) {
-    for (int k = 0; k < kLegalityLeaves; ++k) {
-        auto leaf = operands.at(kLegalityOperand + k);
-
-        if (!leaf.has_value()) {
-            return leaf.error();
-        }
-
-        const auto dimensions = leaf->dimensions();
-
-        if (leaf->element_type() != ffi::DataType::PRED || dimensions.size() != (k == kAvailable ? 3u : 4u) || dimensions[1] != nanorts::whole_act::kPlayers || dimensions[2] != capacity) {
-            return operands.refused("Legality leaf " + std::to_string(k) + " is not `[lanes, 2, C, ...]` bool");
-        }
-    }
-
-    window.kinds = static_cast<int32_t>(operands.at(kLegalityOperand + kKind)->dimensions()[3]);
-    window.offsets = static_cast<int32_t>(operands.at(kLegalityOperand + kAttackOffset)->dimensions()[3]);
-    const int64_t produced = operands.at(kLegalityOperand + kProduceType)->dimensions()[3];
-    window.candidates = window.offsets + 2 * kDirections + kDirections * static_cast<int32_t>(types) + kDirections + 1;
+    auto words = operands.at(kLegalityOperand);
     auto key = operands.at(kKeyOperand);
     auto log_weight = operands.at(kLogWeightOperand);
     auto offsets = operands.at(kOffsetsOperand);
+
+    if (!words.has_value()) {
+        return words.error();
+    }
 
     if (!key.has_value()) {
         return key.error();
@@ -611,10 +599,25 @@ ffi::Error check_extras(const nanorts::whole_act::Operands& operands, int64_t ca
         return offsets.error();
     }
 
-    if (window.kinds <= kKindNone || window.offsets <= 0 || produced != types || key->element_type() != ffi::DataType::U32 || log_weight->element_type() != ffi::DataType::F32 || offsets->element_type() != ffi::DataType::S32) {
-        return operands.refused(
-            "the key is uint32 data, the log weights float32 and the attack offsets int32, "
-            "over a Legality grid of the table's types");
+    const auto steps = offsets->dimensions();
+
+    if (offsets->element_type() != ffi::DataType::S32 || steps.size() != 3u || steps[1] <= 0 || steps[2] != kOffsetAxes) {
+        return operands.refused("the attack offsets are `[1, O, 2]` int32");
+    }
+
+    window.offsets = static_cast<int32_t>(steps[1]);
+    window.candidates = window.offsets + 2 * kDirections + kDirections * static_cast<int32_t>(types) + kDirections + 1;
+    const int64_t columns = kProduceTypeColumn + types + window.offsets;
+    const auto rows = words->dimensions();
+
+    if (words->element_type() != ffi::DataType::U32 || rows.size() != 4u || rows[1] != nanorts::whole_act::kPlayers || rows[2] != capacity || rows[3] != (columns + kWordBits - 1) / kWordBits) {
+        return operands.refused("the Legality words are `[lanes, 2, C, W]` uint32, with W words holding a row of the table's types and offsets");
+    }
+
+    window.words = static_cast<int32_t>(rows[3]);
+
+    if (key->element_type() != ffi::DataType::U32 || log_weight->element_type() != ffi::DataType::F32) {
+        return operands.refused("the key is uint32 data and the log weights float32");
     }
 
     return ffi::Error::Success();
@@ -630,7 +633,7 @@ ffi::Error Act(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets 
     if (args.size() != kReadOperands || results.size() != 1) {
         return ffi::Error::InvalidArgument(
             "nanorts_random_act takes the State leaves, the unit table, the player, the "
-            "Legality grid, the key, the log weights and the attack offsets, and returns the "
+            "Legality words, the key, the log weights and the attack offsets, and returns the "
             "Commands");
     }
 
@@ -669,7 +672,7 @@ ffi::Error Act(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets 
 
     const int64_t shared = shared_bytes(size.cells, size.capacity);
 
-    if (size.cells <= 0 || size.capacity <= 0 || size.neutral < 0 || size.types <= 0 || shared > nanorts::whole_act::kSharedLimit || nanorts::whole_act::threads_for(size.capacity) > nanorts::whole_act::kMaxThreads || (units != kEveryUnit && units != kOneUnit)) {
+    if (size.cells <= 0 || size.capacity <= 0 || size.neutral < 0 || size.types <= 0 || shared > nanorts::whole_act::kSharedOptInLimit || nanorts::whole_act::threads_for(size.capacity) > nanorts::whole_act::kMaxThreads || (units != kEveryUnit && units != kOneUnit)) {
         return ffi::Error::InvalidArgument(
             "an act of every unit or of one, over a lane whose act fits one block's threads "
             "and shared memory");

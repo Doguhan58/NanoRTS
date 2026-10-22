@@ -16,6 +16,7 @@ constexpr int64_t kBytesPerCell = 8;
 static_assert(kBytesPerCell == astar::kScratchBytesPerCell + 1);
 constexpr int64_t kLaneBytes = 96;
 constexpr int64_t kBytesPerSlot = 33;
+constexpr int64_t kBytesPerEntity = 12;
 
 constexpr int32_t kAbsent = -1;
 constexpr int32_t kLast = 2147483647;
@@ -86,9 +87,13 @@ __host__ __device__ constexpr bool trains_at_barracks(int64_t code) {
     return code == kBarracksRush || code == kBarracksDefense;
 }
 
-constexpr int64_t shared_bytes(int64_t cells, int64_t capacity) {
-    return kBytesPerCell * cells + kLaneBytes + kBytesPerSlot * capacity;
+constexpr int64_t shared_bytes(int64_t cells, int64_t capacity, int64_t entities) {
+    return kBytesPerCell * cells + kLaneBytes + kBytesPerSlot * capacity + kBytesPerEntity * entities;
 }
+
+constexpr int16_t kEnemyRole = 1;
+constexpr int16_t kResourceRole = 2;
+constexpr int16_t kStockpileRole = 4;
 
 constexpr uint8_t kExecutes = 1;
 constexpr uint8_t kStanding = 2;
@@ -133,6 +138,7 @@ struct Facts {
     int32_t queued = 0;
     int32_t kept_count = 0;
     int32_t standing = 0;
+    int32_t candidate_count = 0;
 };
 
 static_assert(sizeof(Facts) <= kLaneBytes, "the lane's facts outgrew their bytes");
@@ -171,6 +177,28 @@ struct Slots {
         return slots;
     }
 };
+
+struct Candidates {
+    int32_t* birth;
+    int16_t* x;
+    int16_t* y;
+    int16_t* slot;
+    int16_t* roles;
+
+    __device__ static Candidates carve(char* base, int entities) {
+        Candidates candidates;
+        candidates.birth = reinterpret_cast<int32_t*>(base);
+        int16_t* halves = reinterpret_cast<int16_t*>(candidates.birth + entities);
+        candidates.x = halves;
+        candidates.y = halves + entities;
+        candidates.slot = halves + 2 * entities;
+        candidates.roles = halves + 3 * entities;
+        return candidates;
+    }
+};
+
+static_assert(4 + 4 * 2 == kBytesPerEntity, "the per-entity arrays and their bytes disagree");
+static_assert(nanorts::whole_act::kSharedOptInLimit / kBytesPerCell <= INT16_MAX && nanorts::whole_act::kSharedOptInLimit / kBytesPerEntity <= INT16_MAX, "a staged cell or slot outgrew int16");
 
 struct Unit {
     int32_t birth;
@@ -340,37 +368,33 @@ struct Lane {
 };
 
 __device__ void consider(Closest& best, bool candidate, int32_t slot, int32_t born, int32_t distance) {
-    if (candidate && (!best.found || distance < best.distance || (distance == best.distance && born < best.birth))) {
+    if (candidate && (!best.found || distance < best.distance || (distance == best.distance && (born < best.birth || (born == best.birth && slot < best.slot))))) {
         best = Closest{slot, born, distance, true};
     }
 }
 
-template <typename Slot, typename Cell>
-__device__ void closest_units(const Lane<Slot, Cell>& lane, const Unit& unit, bool worker, Closest& enemy, Closest& resource, Closest& stockpile) {
+__device__ void closest_units(const Candidates& candidates, int32_t count, int32_t width, const Unit& unit, bool worker, Closest& enemy, Closest& resource, Closest& stockpile) {
     if (!unit.present) {
         return;
     }
 
-    for (int32_t slot = 0; slot < lane.size.entities; ++slot) {
-        const int32_t born = lane.birth[slot];
+    const int32_t x0 = astar::floor_mod(unit.cell, width);
+    const int32_t y0 = astar::floor_div(unit.cell, width);
+    const int32_t wanted = worker ? kEnemyRole | kResourceRole | kStockpileRole : kEnemyRole;
 
-        if (born == kAbsent) {
+    for (int32_t index = 0; index < count; ++index) {
+        const int32_t roles = candidates.roles[index] & wanted;
+
+        if (roles == 0) {
             continue;
         }
 
-        const int32_t type = lane.type_of(slot);
-        const bool is_enemy = lane.enemy(slot);
-        const bool is_resource = worker && lane.at(type, kIsResource) != 0;
-        const bool is_stockpile = worker && lane.at(type, kIsStockpile) != 0 && lane.owner[slot] == lane.player;
-
-        if (!is_enemy && !is_resource && !is_stockpile) {
-            continue;
-        }
-
-        const int32_t distance = manhattan(unit.cell, lane.cell_at(slot), lane.size.width);
-        consider(enemy, is_enemy, slot, born, distance);
-        consider(resource, is_resource, slot, born, distance);
-        consider(stockpile, is_stockpile, slot, born, distance);
+        const int32_t slot = candidates.slot[index];
+        const int32_t born = candidates.birth[index];
+        const int32_t distance = abs(x0 - candidates.x[index]) + abs(y0 - candidates.y[index]);
+        consider(enemy, (roles & kEnemyRole) != 0, slot, born, distance);
+        consider(resource, (roles & kResourceRole) != 0, slot, born, distance);
+        consider(stockpile, (roles & kStockpileRole) != 0, slot, born, distance);
     }
 }
 
@@ -621,29 +645,22 @@ __device__ Desire production(const Lane<Slot, Cell>& lane, const uint8_t* flags,
 }
 
 template <typename Slot, typename Cell>
-__device__ int32_t training_direction(const Lane<Slot, Cell>& lane, const uint8_t* flags, int32_t cell, int32_t trained) {
+__device__ int32_t training_direction(const Lane<Slot, Cell>& lane, const uint8_t* flags, const Candidates& candidates, int32_t count, int32_t cell, int32_t trained) {
     const Extents& size = lane.size;
     const int32_t x0 = astar::floor_mod(cell, size.width);
     const int32_t y0 = astar::floor_div(cell, size.width);
-    const bool harvests = lane.at(clip(trained, 0, size.types - 1), kCanHarvest) != 0;
+    const int32_t wanted = lane.at(clip(trained, 0, size.types - 1), kCanHarvest) != 0 ? kResourceRole : kEnemyRole;
     int32_t closest[kDirections] = {kLast, kLast, kLast, kLast};
     bool any_near = false;
 
-    for (int32_t slot = 0; slot < size.entities; ++slot) {
-        if (!lane.active(slot)) {
-            continue;
-        }
-
-        const bool near = harvests ? lane.at(lane.type_of(slot), kIsResource) != 0 : lane.enemy(slot);
-
-        if (!near) {
+    for (int32_t index = 0; index < count; ++index) {
+        if ((candidates.roles[index] & wanted) == 0) {
             continue;
         }
 
         any_near = true;
-        const int32_t other = lane.cell_at(slot);
-        const int32_t ex = astar::floor_mod(other, size.width);
-        const int32_t ey = astar::floor_div(other, size.width);
+        const int32_t ex = candidates.x[index];
+        const int32_t ey = candidates.y[index];
 
         for (int32_t direction = 0; direction < kDirections; ++direction) {
             const int32_t distance = abs(x0 + step_x(direction) - ex) + abs(y0 + step_y(direction) - ey);
@@ -682,7 +699,7 @@ struct Row {
 };
 
 template <typename Slot, typename Cell>
-__device__ Row plan(const Lane<Slot, Cell>& lane, const uint8_t* flags, const Usage& usage, const Entry& entry, const Unit& unit) {
+__device__ Row plan(const Lane<Slot, Cell>& lane, const uint8_t* flags, const Candidates& candidates, int32_t count, const Usage& usage, const Entry& entry, const Unit& unit) {
     const Extents& size = lane.size;
     const bool carrying = unit.carried > 0;
     const int32_t target_cell = lane.cell_of(entry.target);
@@ -711,7 +728,7 @@ __device__ Row plan(const Lane<Slot, Cell>& lane, const uint8_t* flags, const Us
             fallback.direction = direction;
         }
     } else if (entry.kind == kTrain) {
-        fallback = production(lane, flags, usage, unit.cell, training_direction(lane, flags, unit.cell, entry.unit_type), entry.unit_type);
+        fallback = production(lane, flags, usage, unit.cell, training_direction(lane, flags, candidates, count, unit.cell, entry.unit_type), entry.unit_type);
     } else if (entry.kind == kBuild) {
         goal = entry.cell;
         radius = 1;
@@ -726,6 +743,7 @@ struct Shared {
     astar::Scratch scratch;
     uint8_t* flags;
     Facts* facts;
+    Candidates candidates;
     Slots slots;
 
     __device__ static Shared carve(uint64_t* shared, const Extents& size) {
@@ -734,7 +752,8 @@ struct Shared {
         carved.flags = carved.scratch.seen + size.cells;
         char* const after_cells = reinterpret_cast<char*>(shared) + kBytesPerCell * size.cells;
         carved.facts = reinterpret_cast<Facts*>(after_cells);
-        carved.slots = Slots::carve(after_cells + kLaneBytes, size.capacity);
+        carved.candidates = Candidates::carve(after_cells + kLaneBytes, size.entities);
+        carved.slots = Slots::carve(after_cells + kLaneBytes + kBytesPerEntity * size.entities, size.capacity);
         return carved;
     }
 };
@@ -777,6 +796,35 @@ __device__ void mark_pending_claims(const Lane<Slot, Cell>& lane, const Shared& 
             const int32_t produced = clip(lane.pending_produced_type[slot], 0, size.types - 1);
             atomicAdd(&shared.facts->reserved[block], static_cast<uint32_t>(lane.cost(produced)));
         }
+    }
+}
+
+template <typename Slot, typename Cell>
+__device__ void stage_candidates(const Lane<Slot, Cell>& lane, const Shared& shared) {
+    const Extents& size = lane.size;
+    const Candidates& candidates = shared.candidates;
+
+    for (int32_t slot = threadIdx.x; slot < size.entities; slot += blockDim.x) {
+        const int32_t born = lane.birth[slot];
+
+        if (born == kAbsent) {
+            continue;
+        }
+
+        const int32_t type = lane.type_of(slot);
+        const int32_t roles = (lane.enemy(slot) ? kEnemyRole : 0) | (lane.at(type, kIsResource) != 0 ? kResourceRole : 0) | (lane.at(type, kIsStockpile) != 0 && lane.owner[slot] == lane.player ? kStockpileRole : 0);
+
+        if (roles == 0) {
+            continue;
+        }
+
+        const int32_t cell = lane.cell_at(slot);
+        const int32_t index = atomicAdd(&shared.facts->candidate_count, 1);
+        candidates.birth[index] = born;
+        candidates.x[index] = static_cast<int16_t>(astar::floor_mod(cell, size.width));
+        candidates.y[index] = static_cast<int16_t>(astar::floor_div(cell, size.width));
+        candidates.slot[index] = static_cast<int16_t>(slot);
+        candidates.roles[index] = static_cast<int16_t>(roles);
     }
 }
 
@@ -1060,6 +1108,7 @@ __global__ void __launch_bounds__(nanorts::whole_act::kMaxThreads) act_kernel(In
     const int32_t other = gathered(1 - lane.player, nanorts::whole_act::kPlayers);
 
     mark_pending_claims(lane, shared);
+    stage_candidates(lane, shared);
     Unit unit{kAbsent, kAbsent, 0, 0, 0, false, false};
     Entry entry{};
     const uint32_t next_order = static_cast<uint32_t>(in.next_order.at(lane_index)[0]);
@@ -1077,10 +1126,11 @@ __global__ void __launch_bounds__(nanorts::whole_act::kMaxThreads) act_kernel(In
         unit.rank = rank_among_present(shared.slots, capacity, unit.birth);
     }
 
+    const int32_t count = facts->candidate_count;
     Closest enemy;
     Closest resource;
     Closest stockpile;
-    closest_units(lane, unit, worker, enemy, resource, stockpile);
+    closest_units(shared.candidates, count, size.width, unit, worker, enemy, resource, stockpile);
     __syncthreads();
 
     decide(lane, shared.flags, facts, strategy, entry, unit, enemy, resource, stockpile, next_order);
@@ -1092,7 +1142,7 @@ __global__ void __launch_bounds__(nanorts::whole_act::kMaxThreads) act_kernel(In
     Row row{};
 
     if (owns) {
-        row = plan(lane, shared.flags, usage, entry, unit);
+        row = plan(lane, shared.flags, shared.candidates, count, usage, entry, unit);
         record_row(shared, entry, unit, row, standing, executes);
     }
 
@@ -1165,7 +1215,13 @@ ffi::Error launch(cudaStream_t stream, nanorts::whole_act::Operands& operands, c
     }
 
     const int threads = nanorts::whole_act::threads_for(size.capacity);
-    const int64_t shared = shared_bytes(size.cells, size.capacity);
+    const int64_t shared = shared_bytes(size.cells, size.capacity, size.entities);
+    static nanorts::whole_act::SharedOptIn opt_in;
+
+    if (auto e = opt_in.allow(operands, nanorts::kernel(act_kernel<Slot, Cell>), shared); e.failure()) {
+        return e;
+    }
+
     act_kernel<Slot, Cell><<<static_cast<unsigned>(lanes), threads, static_cast<size_t>(shared), stream>>>(in, outputs, size, strategy);
     return nanorts::launched();
 }
@@ -1213,9 +1269,9 @@ ffi::Error Act(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets 
     size.capacity = static_cast<int32_t>(issued[3]);
     size.neutral = size.entities - nanorts::whole_act::kPlayers * size.capacity;
     size.types = static_cast<int32_t>(table[1]);
-    const int64_t shared = shared_bytes(size.cells, size.capacity);
+    const int64_t shared = shared_bytes(size.cells, size.capacity, size.entities);
 
-    if (size.cells <= 0 || size.capacity <= 0 || size.neutral < 0 || size.types <= 0 || shared > nanorts::whole_act::kSharedLimit || nanorts::whole_act::threads_for(size.capacity) > nanorts::whole_act::kMaxThreads || (code != kWorkerRush && code != kBarracksRush && code != kWorkerDefense && code != kBarracksDefense) || (trains_at_barracks(code) && (trained < 0 || trained >= size.types)) || size.types <= kTypeWorker) {
+    if (size.cells <= 0 || size.capacity <= 0 || size.neutral < 0 || size.types <= 0 || shared > nanorts::whole_act::kSharedOptInLimit || nanorts::whole_act::threads_for(size.capacity) > nanorts::whole_act::kMaxThreads || (code != kWorkerRush && code != kBarracksRush && code != kWorkerDefense && code != kBarracksDefense) || (trains_at_barracks(code) && (trained < 0 || trained >= size.types)) || size.types <= kTypeWorker) {
         return ffi::Error::InvalidArgument(
             "a strategy and trained type the table holds, over a lane whose act fits one "
             "block's threads and shared memory");

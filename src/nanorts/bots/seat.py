@@ -11,6 +11,7 @@ from jax.typing import DTypeLike
 from jaxmarl.environments import spaces
 from jaxmarl.environments.multi_agent_env import MultiAgentEnv
 
+from nanorts import core
 from nanorts.adapters import EnvironmentState, episode_root, jaxmarl, select
 from nanorts.bots.bot import Bot, turn_key
 from nanorts.model import (
@@ -18,6 +19,8 @@ from nanorts.model import (
     Commands,
     GameConfig,
     ModelError,
+    State,
+    StepResult,
     Telemetry,
     UnitTypeTableVersion,
 )
@@ -62,7 +65,7 @@ class SeatStep[Carry]:
 
     spawn_overflowed: Array
 
-    final_observation: jaxmarl.Observation
+    final_observation: jaxmarl.Observation | None
 
     final_valid: Array
 
@@ -79,17 +82,39 @@ def reset_seat[Carry](environment_root: Array, game: GameConfig, *, bot: Bot[Car
 
 
 def step_seat[Carry](seat_state: SeatState[Carry], actions: Array, game: GameConfig, *, bot: Bot[Carry], layout: jaxmarl.JaxMARLLayout, assets: Any = None, seat: str | int | Array = "player_0") -> SeatStep[Carry]:
-    environment_state = seat_state.environment_state
+    request, carry = _seat_request(
+        seat_state, actions, game, bot=bot, layout=layout, assets=assets, seat=seat
+    )
+    return _seat_response(
+        seat_state,
+        carry,
+        core.step(*request, game),
+        game,
+        bot=bot,
+        layout=layout,
+        assets=assets,
+        seat=seat,
+    )
+
+
+def _seat_request[Carry](seat_state: SeatState[Carry], actions: Array, game: GameConfig, *, bot: Bot[Carry], layout: jaxmarl.JaxMARLLayout, assets: Any, seat: str | int | Array) -> tuple[tuple[Array, State, Commands], Carry]:
     carry, commands = seat_commands(seat_state, game, bot=bot, seat=seat)
-    learner = _current(seat, seat_state.seat)
-    result = jaxmarl.step_against(
-        environment_state,
-        learner,
+    request = jaxmarl.request_against(
+        seat_state.environment_state,
+        _current(seat, seat_state.seat),
         actions,
         commands,
         game,
         layout=layout,
         assets=assets,
+    )
+    return request, carry
+
+
+def _seat_response[Carry](seat_state: SeatState[Carry], carry: Carry, stepped: StepResult, game: GameConfig, *, bot: Bot[Carry], layout: jaxmarl.JaxMARLLayout, assets: Any, seat: str | int | Array) -> SeatStep[Carry]:
+    learner = _current(seat, seat_state.seat)
+    result = jaxmarl.respond(
+        seat_state.environment_state, stepped, game, layout=layout, assets=assets
     )
     following = jnp.where(
         result.done,
@@ -115,7 +140,11 @@ def step_seat[Carry](seat_state: SeatState[Carry], actions: Array, game: GameCon
         winner=result.winner,
         telemetry=result.telemetry,
         spawn_overflowed=result.spawn_overflowed,
-        final_observation=_learners(result.final_observations, seat, seat_state.seat),
+        final_observation=(
+            None
+            if result.final_observations is None
+            else _learners(result.final_observations, seat, seat_state.seat)
+        ),
         final_valid=result.final_valid,
     )
 
@@ -205,7 +234,20 @@ class SeatEnv(MultiAgentEnv):
                 "episode's root, with the bot's initial carry and the seat rule's "
                 "next seat"
             )
-        result = step_seat(
+        return self._outputs(
+            step_seat(
+                state,
+                actions[LEARNER],
+                self.game,
+                bot=self.bot,
+                layout=self.layout,
+                assets=self.assets,
+                seat=self.seat,
+            )
+        )
+
+    def step_request(self, state: SeatState[Any], actions: dict[str, Array]) -> tuple[tuple[Array, State, Commands], Any]:
+        return _seat_request(
             state,
             actions[LEARNER],
             self.game,
@@ -214,6 +256,22 @@ class SeatEnv(MultiAgentEnv):
             assets=self.assets,
             seat=self.seat,
         )
+
+    def step_response(self, state: SeatState[Any], carry: Any, stepped: StepResult) -> tuple[dict[str, Any], SeatState[Any], dict[str, Array], dict[str, Array], dict[str, Any],]:
+        return self._outputs(
+            _seat_response(
+                state,
+                carry,
+                stepped,
+                self.game,
+                bot=self.bot,
+                layout=self.layout,
+                assets=self.assets,
+                seat=self.seat,
+            )
+        )
+
+    def _outputs(self, result: SeatStep[Any]) -> tuple[dict[str, Any], SeatState[Any], dict[str, Array], dict[str, Array], dict[str, Any],]:
         infos: dict[str, Any] = {
             "terminated": result.terminated,
             "truncated": result.truncated,

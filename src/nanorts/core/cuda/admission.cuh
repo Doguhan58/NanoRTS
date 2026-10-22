@@ -46,7 +46,7 @@ struct CommandTable {
 };
 
 template <typename Slot, typename Cell>
-__device__ int32_t order_requests(const LaneState<Slot, Cell>& state, const Extents& size, const CommandTable& commands, int32_t* requests, uint64_t* listed) {
+__device__ int32_t order_requests(const LaneState<Slot, Cell>& state, const Extents& size, const CommandTable& commands, Slot* requests, uint64_t* listed) {
     const int lane = threadIdx.x % 32;
     const int rank_bits = max(1, 32 - __clz(size.capacity - 1));
     const int32_t highest_rank = (1 << rank_bits) - 1;
@@ -84,7 +84,7 @@ __device__ int32_t order_requests(const LaneState<Slot, Cell>& state, const Exte
                 place += listed[other] < entry;
             }
 
-            requests[ordered + place] = size.neutral + ranked_local(entry);
+            requests[ordered + place] = static_cast<Slot>(size.neutral + ranked_local(entry));
         }
 
         __syncwarp();
@@ -203,7 +203,7 @@ __device__ void assign_pending_action(const LaneState<Slot, Cell>& state, int32_
 }
 
 template <typename Slot, typename Cell>
-__device__ void admit_one(const LaneState<Slot, Cell>& state, const Extents& size, const Content& content, const int32_t* entries, int32_t count, Strategy strategy, draws::Key root, const Admitted& admitted, int32_t slot, const Command& command) {
+__device__ void admit_one(const LaneState<Slot, Cell>& state, const Extents& size, const Content& content, const Slot* entries, int32_t count, Strategy strategy, draws::Key root, const Admitted& admitted, int32_t slot, const Command& command) {
     const bool leader = threadIdx.x % 32 == 0;
     const int32_t player = (slot - size.neutral) / size.capacity;
     const int32_t time = *state.time;

@@ -39,6 +39,11 @@ def _load() -> tuple[_Library | None, str]:
             ctypes.POINTER(ctypes.c_int32),
             ctypes.c_int64,
         ]
+        handle.nanorts_shared_opt_in.restype = ctypes.c_int64
+        handle.nanorts_shared_opt_in.argtypes = [
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.c_int64,
+        ]
         digest = handle.nanorts_build_id().decode()
         targets = tuple(
             sorted(filter(None, handle.nanorts_targets().decode().split(",")))
@@ -77,6 +82,13 @@ def build_id() -> str | None:
 
 def targets() -> tuple[str, ...]:
     return () if LIBRARY is None else LIBRARY.targets
+
+
+def shared_opt_in(devices: list[int]) -> int:
+    if LIBRARY is None:
+        return 0
+    ordinals = (ctypes.c_int32 * len(devices))(*devices)
+    return LIBRARY.handle.nanorts_shared_opt_in(ordinals, len(devices))
 
 
 def self_check(devices: list[int]) -> str:

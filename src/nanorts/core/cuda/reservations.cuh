@@ -34,6 +34,10 @@ __device__ inline bool reservations_conflict(const Reservation& existing, const 
     return shared_position || over_budget;
 }
 
+__device__ inline bool may_conflict(const Reservation& requested) {
+    return requested.claims_position || requested.cost != 0;
+}
+
 struct PendingClaim {
     Reservation reservation;
     int32_t duration;
@@ -78,12 +82,15 @@ __device__ void cancel_pending_action(const LaneState<Slot, Cell>& state, int32_
 }
 
 template <typename Slot, typename Cell, typename PendingClaimOf>
-__device__ Resolved resolve(const LaneState<Slot, Cell>& state, const Extents& size, const int32_t* entries, int32_t count, Strategy strategy, draws::Key root, const RequestedAction& request, PendingClaimOf pending_claim_of) {
+__device__ Resolved resolve(const LaneState<Slot, Cell>& state, const Extents& size, const Slot* entries, int32_t count, Strategy strategy, draws::Key root, const RequestedAction& request, PendingClaimOf pending_claim_of) {
+    if (!may_conflict(request.reservation)) {
+        return Resolved{request.kind, request.none_duration, 0};
+    }
+
     const int lane = threadIdx.x % 32;
     const unsigned lanes_below_mask = (1u << lane) - 1u;
     const int32_t time = *state.time;
     const int32_t alternating_count = *state.alternating_conflict_count;
-    const draws::Key draw_key = strategy == kCancelRandom ? draws::conflict_address(root, time, request.birth) : draws::Key{0u, 0u};
     int32_t same_cycle_conflicts = 0;
     bool any_cross_cycle = false;
     int32_t request_duration_cap = kNoCap;
@@ -123,7 +130,7 @@ __device__ Resolved resolve(const LaneState<Slot, Cell>& state, const Extents& s
             cancels_request = floor_mod(wrapping_add(alternating_count, same_cycle_before), 2) == 0;
             cancels_pending = !cancels_request;
         } else if (strategy == kCancelRandom) {
-            cancels_request = same_cycle_conflict && draws::conflict_draw(draw_key, same_cycle_before) == 0;
+            cancels_request = same_cycle_conflict && draws::conflict_draw(draws::conflict_address(root, time, request.birth), same_cycle_before) == 0;
             cancels_pending = !cancels_request;
         }
 

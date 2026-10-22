@@ -10,7 +10,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, cast
 
@@ -23,6 +23,7 @@ import numpy as np
 import optax
 import yaml
 from jax import Array
+from jax.extend.random import threefry2x32_p
 
 import nanorts
 from nanorts import bots, kernels, rendering
@@ -61,6 +62,7 @@ BLOCK = max(ACTION_WIDTHS[:-1])
 PADDED_WIDTH = SMALL * BLOCK + ACTION_WIDTHS[-1]
 
 MASK_VALUE = -1e8
+DENSE_DECISION_SLOTS = 16_384
 
 WILSON_Z = 1.959964
 DTYPES = {"float32": jnp.float32, "bfloat16": jnp.bfloat16}
@@ -86,6 +88,10 @@ _WORD = np.where(_SOURCE < _HEAD, 0, 1 + _ATTACK // 32)
 _SHIFT = np.where(_SOURCE < _HEAD, np.maximum(_SOURCE, 0), _ATTACK % 32).astype(
     np.uint32
 )
+_SMALL_ENTRIES = np.arange(SMALL * BLOCK, dtype=np.uint32).reshape(SMALL, BLOCK)
+_ATTACK_ENTRIES = np.arange(ACTION_WIDTHS[-1], dtype=np.uint32)
+_TINY = np.finfo(np.float32).tiny
+_INDEXED_SLOTS = 2**32 // ACTION_WIDTHS[-1]
 
 
 class ConfigError(ValueError): ...
@@ -145,6 +151,7 @@ class Config:
     head_width: int = 128
     window: int = 3
     slot_limit: int = 16
+    chunk_slots: int = 1
     dtype: str = "bfloat16"
 
     eval_every: int = 10_000_000
@@ -316,6 +323,7 @@ def _checked(config: Config) -> Config:
         "hidden",
         "layers",
         "head_width",
+        "chunk_slots",
         "eval_games",
         "video_stride",
         "video_frame_ms",
@@ -409,23 +417,51 @@ def _window_table(height: int, width: int, window: int) -> tuple[np.ndarray, np.
     return (row * side + column).astype(np.int32), outside
 
 
-def slot_features(feature_maps: Array, cells: Array, mask: Array, *, window: int, dtype: Any) -> Array:
-    batch, height, width, maps = feature_maps.shape
+def _padded_grid(feature_maps: Array, window: int) -> Array:
+    batch, _, _, maps = feature_maps.shape
     radius = window // 2
-    grid = jnp.pad(
+    return jnp.pad(
         feature_maps, ((0, 0), (radius, radius), (radius, radius), (0, 0))
     ).reshape(batch, -1, maps)
+
+
+def _encoded_slots(values: Array, outside: Array, cells: Array, mask: Array, *, cell_count: int, dtype: Any) -> Array:
+    values = jnp.where(outside[..., None], -1, values)
+    planes = _planes(values, dtype).reshape(*cells.shape, -1)
+    position = cells[..., None] == jnp.arange(cell_count, dtype=cells.dtype)
+    return jnp.concatenate(
+        [planes, mask.astype(dtype), position.astype(dtype)], axis=-1
+    )
+
+
+def slot_features(feature_maps: Array, cells: Array, mask: Array, *, window: int, dtype: Any) -> Array:
+    batch, height, width, _ = feature_maps.shape
+    grid = _padded_grid(feature_maps, window)
     table, outside = _window_table(height, width, window)
     cell = jnp.maximum(cells, 0)
     index = jnp.asarray(table)[cell].reshape(batch, -1)
     values = jax.vmap(lambda rows, at: rows[at])(grid, index).astype(jnp.int32)
-    values = jnp.where(
-        jnp.asarray(outside)[cell].reshape(batch, -1)[..., None], -1, values
+    return _encoded_slots(
+        values,
+        jnp.asarray(outside)[cell].reshape(batch, -1),
+        cells,
+        mask,
+        cell_count=height * width,
+        dtype=dtype,
     )
-    planes = _planes(values, dtype).reshape(*cells.shape, -1)
-    position = cells[..., None] == jnp.arange(height * width, dtype=cells.dtype)
-    return jnp.concatenate(
-        [planes, mask.astype(dtype), position.astype(dtype)], axis=-1
+
+
+def _listed_slot_features(grid: Array, entry_rows: Array, cells: Array, mask: Array, *, height: int, width: int, window: int, dtype: Any) -> Array:
+    table, outside = _window_table(height, width, window)
+    cell = jnp.maximum(cells, 0)
+    values = grid[entry_rows[:, None], jnp.asarray(table)[cell]].astype(jnp.int32)
+    return _encoded_slots(
+        values,
+        jnp.asarray(outside)[cell],
+        cells,
+        mask,
+        cell_count=height * width,
+        dtype=dtype,
     )
 
 
@@ -467,6 +503,13 @@ class SlotActorCritic(nn.Module):
 
     def value(self, feature_maps: Array) -> Array:
         return self._value(flat_planes(feature_maps).astype(DTYPES[self.dtype]))
+
+    def context(self, feature_maps: Array) -> tuple[Array, Array]:
+        inputs = flat_planes(feature_maps).astype(DTYPES[self.dtype])
+        return self.slot_context(self._trunk(self.actor, inputs)), self._value(inputs)
+
+    def head(self, slots: Array, context: Array) -> Array:
+        return self.slot_logits(nn.relu(self.slot_input(slots) + context))
 
     def _trunk(self, layers: Sequence[nn.Dense], x: Array) -> Array:
         for layer in layers:
@@ -552,10 +595,7 @@ def sample_actions(key: Array, logits: Array, mask: Array) -> tuple[Array, Array
     return actions, evaluate_actions(logits, mask, actions)[0]
 
 
-def evaluate_actions(logits: Array, mask: Array, actions: Array) -> tuple[Array, Array]:
-    actions = actions.astype(jnp.int32)
-    log_prob = jnp.zeros(logits.shape[:-2], jnp.float32)
-    entropy = jnp.zeros(logits.shape[:-2], jnp.float32)
+def _block_terms(logits: Array, mask: Array, actions: Array) -> Iterator[tuple[Array, Array, Array]]:
     parts = zip(
         _blocks(jnp.where(mask, logits, _FLOOR)),
         _blocks(mask),
@@ -569,11 +609,65 @@ def evaluate_actions(logits: Array, mask: Array, actions: Array) -> tuple[Array,
         drawn = jnp.sum(
             jnp.where(chosen[..., None] == entries, normalized, 0.0), axis=-1
         )
+        yield normalized, live, drawn
+
+
+def evaluate_actions(logits: Array, mask: Array, actions: Array) -> tuple[Array, Array]:
+    actions = actions.astype(jnp.int32)
+    log_prob = jnp.zeros(logits.shape[:-2], jnp.float32)
+    entropy = jnp.zeros(logits.shape[:-2], jnp.float32)
+    for normalized, live, drawn in _block_terms(logits, mask, actions):
         spread = -jnp.sum(jnp.exp(normalized) * normalized, axis=-1)
         axes = tuple(range(logits.ndim - 2, live.ndim))
         log_prob += jnp.sum(jnp.where(live, drawn, 0.0), axis=axes)
         entropy += jnp.sum(jnp.where(live, spread, 0.0), axis=axes)
     return log_prob, entropy
+
+
+def _indexed_draws_valid(key: Array) -> bool:
+    return (
+        jnp.issubdtype(key.dtype, jax.dtypes.prng_key)
+        and str(jax.random.key_impl(key)) == "threefry2x32"
+        and bool(jax.config.jax_threefry_partitionable)
+        and not jax.config.jax_high_dynamic_range_gumbel
+        and not jax.config.jax_enable_x64
+    )
+
+
+def _gumbel_at(key: Array, index: Array) -> Array:
+    data = jax.random.key_data(key)
+    high, low = threefry2x32_p.bind(
+        data[0], data[1], jnp.zeros(index.shape, jnp.uint32), index
+    )
+    mantissa = ((high ^ low) >> np.uint32(9)) | np.uint32(0x3F800000)
+    floats = jax.lax.bitcast_convert_type(mantissa, jnp.float32) - np.float32(1.0)
+    return -jnp.log(-jnp.log(jnp.maximum(_TINY, floats + _TINY)))
+
+
+def _indexed_draws(keys: Array, logits: Array, mask: Array, dense_index: Array) -> Array:
+    small, attack = _blocks(jnp.where(mask, logits, _FLOOR))
+    flat = dense_index.astype(jnp.uint32)[:, None]
+    small_noise = _gumbel_at(
+        keys[0], flat[..., None] * np.uint32(SMALL * BLOCK) + _SMALL_ENTRIES
+    )
+    attack_noise = _gumbel_at(
+        keys[1], flat * np.uint32(ACTION_WIDTHS[-1]) + _ATTACK_ENTRIES
+    )
+    return jnp.concatenate(
+        [
+            jnp.argmax(small_noise + small, axis=-1),
+            jnp.argmax(attack_noise + attack, axis=-1)[..., None],
+        ],
+        axis=-1,
+    ).astype(jnp.int32)
+
+
+def _drawn_log_probs(logits: Array, mask: Array, actions: Array) -> Array:
+    small, attack = (
+        jnp.where(live, drawn, 0.0)
+        for _, live, drawn in _block_terms(logits, mask, actions)
+    )
+    return jnp.concatenate([small, attack[..., None]], axis=-1)
 
 
 KIND_PARAMETERS = ((), (1,), (2,), (3,), (4, 5), (6,))
@@ -592,6 +686,180 @@ def invalid_draws(mask: Array, actions: Array) -> Array:
         for factor in parameters:
             valid &= (kind != code) | drawn(factor)
     return jnp.sum(~valid, axis=-1, dtype=jnp.int32)
+
+
+class _SlotList(NamedTuple):
+    grid: Array
+    cells: Array
+    mask: Array
+    actions: Array
+    order: Array
+    counts: Array
+    starts: Array
+
+
+class _SlotChunk(NamedTuple):
+    start: Array
+    entry_rows: Array
+    valid: Array
+    features: Array
+    mask: Array
+    actions: Array
+
+
+def _slot_list(trajectory: Trajectory, window: int) -> _SlotList:
+    live = live_slots(unpack_padded(trajectory.mask))
+    counts = jnp.sum(live, axis=-1, dtype=jnp.int32)
+    return _SlotList(
+        grid=_padded_grid(trajectory.feature_maps, window),
+        cells=trajectory.cells,
+        mask=trajectory.mask,
+        actions=trajectory.actions,
+        order=select_slots(live, live.shape[-1]),
+        counts=counts,
+        starts=jnp.cumsum(counts) - counts,
+    )
+
+
+def _entry_rows(ends: Array, position: Array) -> Array:
+    return jnp.minimum(
+        jnp.searchsorted(ends, position, side="right", method="scan_unrolled"),
+        len(ends) - 1,
+    ).astype(jnp.int32)
+
+
+def _row_sums(values: Array, start: Array, listed: _SlotList) -> Array:
+    rank = jnp.arange(listed.order.shape[-1], dtype=jnp.int32)
+    offset = listed.starts[:, None] + rank - start
+    taken = (rank < listed.counts[:, None]) & (offset >= 0) & (offset < len(values))
+    gathered = values[jnp.clip(offset, 0, len(values) - 1)]
+    taken = taken.reshape(taken.shape + (1,) * (gathered.ndim - taken.ndim))
+    return jnp.sum(jnp.where(taken, gathered, 0), axis=1, dtype=jnp.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ChunkedHead:
+    model: SlotActorCritic
+    size: int
+    height: int
+    width: int
+
+    def trips(self, listed: _SlotList) -> Array:
+        return (listed.starts[-1] + listed.counts[-1] + self.size - 1) // self.size
+
+    def chunk(self, listed: _SlotList, index: Array) -> _SlotChunk:
+        capacity = listed.order.shape[-1]
+        start = index * self.size
+        position = start + jnp.arange(self.size, dtype=jnp.int32)
+        ends = listed.starts + listed.counts
+        row = _entry_rows(ends, position)
+        slot = listed.order[
+            row, jnp.clip(position - listed.starts[row], 0, capacity - 1)
+        ]
+        cells = listed.cells[row, slot]
+        mask = unpack_padded(listed.mask[row, slot])
+        return _SlotChunk(
+            start=start,
+            entry_rows=row,
+            valid=position < ends[-1],
+            features=_listed_slot_features(
+                listed.grid,
+                row,
+                cells,
+                mask,
+                height=self.height,
+                width=self.width,
+                window=self.model.window,
+                dtype=jnp.int8,
+            ),
+            mask=mask,
+            actions=listed.actions[row, slot],
+        )
+
+    def terms(self, params: Any, context: Array, chunk: _SlotChunk) -> tuple[Array, Array]:
+        logits = self.model.apply(
+            params, chunk.features, context, method=SlotActorCritic.head
+        )
+        return evaluate_actions(
+            logits[:, None], chunk.mask[:, None], chunk.actions[:, None]
+        )
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
+def _head_terms(head: _ChunkedHead, params: Any, context: Array, listed: _SlotList) -> tuple[Array, Array]:
+    return _head_terms_forward(head, params, context, listed)[0]
+
+
+def _head_terms_forward(head: _ChunkedHead, params: Any, context: Array, listed: _SlotList) -> Any:
+    def body(carry: tuple[Array, Array, Array]) -> tuple[Array, Array, Array]:
+        index, log_prob, entropy = carry
+        chunk = head.chunk(listed, index)
+        drawn, spread = head.terms(params, context[chunk.entry_rows], chunk)
+        return (
+            index + 1,
+            log_prob + _row_sums(drawn, chunk.start, listed),
+            entropy + _row_sums(spread, chunk.start, listed),
+        )
+
+    zeros = jnp.zeros(len(context), jnp.float32)
+    _, log_prob, entropy = jax.lax.while_loop(
+        lambda carry: carry[0] < head.trips(listed), body, (jnp.int32(0), zeros, zeros)
+    )
+    return (log_prob, entropy), (params, context, listed)
+
+
+def _head_terms_backward(head: _ChunkedHead, residuals: Any, cotangents: tuple[Array, Array]) -> Any:
+    params, context, listed = residuals
+    d_log_prob, d_entropy = cotangents
+
+    def body(carry: Any) -> Any:
+        index, d_params, d_context = carry
+        chunk = head.chunk(listed, index)
+        _, pullback = jax.vjp(
+            lambda params, entry_context: head.terms(params, entry_context, chunk),
+            params,
+            context[chunk.entry_rows],
+        )
+        part_params, part_context = pullback(
+            (
+                jnp.where(chunk.valid, d_log_prob[chunk.entry_rows], 0.0),
+                jnp.where(chunk.valid, d_entropy[chunk.entry_rows], 0.0),
+            )
+        )
+        return (
+            index + 1,
+            jax.tree.map(jnp.add, d_params, part_params),
+            d_context + _row_sums(part_context, chunk.start, listed),
+        )
+
+    _, d_params, d_context = jax.lax.while_loop(
+        lambda carry: carry[0] < head.trips(listed),
+        body,
+        (
+            jnp.int32(0),
+            jax.tree.map(jnp.zeros_like, params),
+            jnp.zeros(context.shape, jnp.float32),
+        ),
+    )
+    listed_cotangent = jax.tree.map(
+        lambda leaf: np.zeros(leaf.shape, jax.dtypes.float0), listed
+    )
+    return d_params, d_context.astype(context.dtype), listed_cotangent
+
+
+_head_terms.defvjp(_head_terms_forward, _head_terms_backward)
+
+
+def live_slot_terms(model: SlotActorCritic, params: Any, context: Array, trajectory: Trajectory, chunk_slots: int) -> tuple[Array, Array]:
+    rows, capacity = trajectory.cells.shape
+    _, height, width, _ = trajectory.feature_maps.shape
+    head = _ChunkedHead(model, rows * min(chunk_slots, capacity), height, width)
+    head_params = {
+        "params": {
+            name: params["params"][name] for name in ("slot_input", "slot_logits")
+        }
+    }
+    return _head_terms(head, head_params, context, _slot_list(trajectory, model.window))
 
 
 def gae(rewards: Array, values: Array, dones: Array, last_value: Array, *, gamma: float, gae_lambda: float) -> tuple[Array, Array]:
@@ -731,14 +999,90 @@ class Decision(NamedTuple):
     value: Array
 
 
-def decide(model: SlotActorCritic, params: Any, feature_maps: Array, cells: Array, rows: Array, key: Array, limit: int) -> Decision:
+def _live_decision(model: SlotActorCritic, params: Any, feature_maps: Array, cells: Array, mask: Array, live: Array, key: Array, chunk_slots: int) -> tuple[Array, Array, Array]:
+    batch, height, width, _ = feature_maps.shape
+    limit = cells.shape[-1]
+    size = batch * min(chunk_slots, limit)
+    length = -(-batch * limit // size) * size
+    counts = jnp.sum(live, axis=-1, dtype=jnp.int32)
+    ends = jnp.cumsum(counts)
+    starts = ends - counts
+    context, value = model.apply(params, feature_maps, method=SlotActorCritic.context)
+    grid = _padded_grid(feature_maps, model.window)
+    keys = jax.random.split(key)
+
+    def body(carry: tuple[Array, Array, Array]) -> tuple[Array, Array, Array]:
+        index, actions, terms = carry
+        start = index * size
+        position = start + jnp.arange(size, dtype=jnp.int32)
+        row = _entry_rows(ends, position)
+        rank = jnp.clip(position - starts[row], 0, limit - 1)
+        entry_mask = mask[row, rank]
+        features = _listed_slot_features(
+            grid,
+            row,
+            cells[row, rank],
+            entry_mask,
+            height=height,
+            width=width,
+            window=model.window,
+            dtype=jnp.int8,
+        )
+        logits = model.apply(
+            params, features, context[row], method=SlotActorCritic.head
+        )
+        drawn = _indexed_draws(keys, logits, entry_mask, row * limit + rank)
+        return (
+            index + 1,
+            jax.lax.dynamic_update_slice(actions, drawn, (start, 0)),
+            jax.lax.dynamic_update_slice(
+                terms, _drawn_log_probs(logits, entry_mask, drawn), (start, 0)
+            ),
+        )
+
+    _, actions, terms = jax.lax.while_loop(
+        lambda carry: carry[0] * size < ends[-1],
+        body,
+        (
+            jnp.int32(0),
+            jnp.zeros((length, SMALL + 1), jnp.int32),
+            jnp.zeros((length, SMALL + 1), jnp.float32),
+        ),
+    )
+    list_positions = jnp.minimum(
+        starts[:, None] + jnp.arange(limit, dtype=jnp.int32), length - 1
+    )
+    selected = jnp.where(live[..., None], actions[list_positions], 0)
+    slot_terms = jnp.where(live[..., None], terms[list_positions], 0.0)
+    log_prob = jnp.zeros(batch, jnp.float32)
+    log_prob += jnp.sum(slot_terms[..., :SMALL], axis=(1, 2))
+    log_prob += jnp.sum(slot_terms[..., SMALL], axis=1)
+    return selected, log_prob, value
+
+
+def decide(model: SlotActorCritic, params: Any, feature_maps: Array, cells: Array, rows: Array, key: Array, limit: int, chunk_slots: int) -> Decision:
     capacity = cells.shape[-1]
     padded = pad_rows(rows, False)
     live = live_slots(padded)
     slots = select_slots(live, min(limit or capacity, capacity))
     rows, cells, mask = (_taken(part, slots) for part in (rows, cells, padded))
-    logits, value = policy(model, params, feature_maps, cells, mask)
-    selected, log_prob = sample_actions(key, logits, mask)
+    if (
+        DENSE_DECISION_SLOTS <= slots.size < _INDEXED_SLOTS
+        and _indexed_draws_valid(key)
+    ):
+        selected, log_prob, value = _live_decision(
+            model,
+            params,
+            feature_maps,
+            cells,
+            mask,
+            _taken(live, slots),
+            key,
+            chunk_slots,
+        )
+    else:
+        logits, value = policy(model, params, feature_maps, cells, mask)
+        selected, log_prob = sample_actions(key, logits, mask)
     hit = slots[..., None] == jnp.arange(capacity, dtype=jnp.int32)
     actions = jnp.sum(
         jnp.where(hit[..., None], selected[..., None, :], 0), axis=-3, dtype=jnp.int32
@@ -759,7 +1103,7 @@ class _Step(NamedTuple):
     infos: dict[str, Any]
 
 
-def _act(layout: _RowLayout, model: SlotActorCritic, params: Any, states: Any, feature_maps: Array, key: Array, limit: int) -> _Step:
+def _act(layout: _RowLayout, model: SlotActorCritic, params: Any, states: Any, feature_maps: Array, key: Array, limit: int, chunk_slots: int) -> _Step:
     mix = layout.mix
     step_key, sample_key = jax.random.split(key)
     rows = mix.get_avail_actions(states)
@@ -771,6 +1115,7 @@ def _act(layout: _RowLayout, model: SlotActorCritic, params: Any, states: Any, f
         rows,
         sample_key,
         limit,
+        chunk_slots,
     )
     observations, following, _, done, infos = mix.step(
         step_key, states, decision.actions
@@ -788,7 +1133,9 @@ def _act(layout: _RowLayout, model: SlotActorCritic, params: Any, states: Any, f
 
 def act(params: Any, feature_maps: Array, cells: Array, mask: Array, key: Array, *, config: Config) -> Array:
     batch = (feature_maps[None], cells[None], mask[None])
-    return decide(network(config), params, *batch, key, config.slot_limit).actions[0]
+    return decide(
+        network(config), params, *batch, key, config.slot_limit, config.chunk_slots
+    ).actions[0]
 
 
 def roster_runs() -> bool:
@@ -974,6 +1321,7 @@ class Evaluation:
                 loop.widened(masks, held_masks),
                 sample_key,
                 self.config.slot_limit,
+                self.config.chunk_slots,
             )
             observations, following, _, done, infos = part.step(
                 step_key, carry.states, loop.narrowed(decision.actions)
@@ -1155,6 +1503,7 @@ class Training:
                 runner.feature_maps,
                 step_key,
                 self.config.slot_limit,
+                self.config.chunk_slots,
             )
             decision, done = step.decision, step.done
             reward = step.infos["reward_components"] @ weights
@@ -1201,12 +1550,13 @@ class Training:
 
     def _loss(self, params: Any, batch: tuple[Trajectory, Array, Array]) -> Any:
         trajectory, advantages, returns = batch
-        mask = unpack_padded(trajectory.mask)
-        logits, value = policy(
-            self.model, params, trajectory.feature_maps, trajectory.cells, mask
-        )
-        log_prob, entropy = evaluate_actions(logits, mask, trajectory.actions)
         config = self.config
+        context, value = self.model.apply(
+            params, trajectory.feature_maps, method=SlotActorCritic.context
+        )
+        log_prob, entropy = live_slot_terms(
+            self.model, params, context, trajectory, config.chunk_slots
+        )
         return ppo_loss(
             log_prob,
             value,

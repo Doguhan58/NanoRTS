@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import Any
 
 import jax
@@ -23,7 +24,7 @@ from nanorts.model import (
     StepResult,
 )
 
-__all__ = ["legal_commands", "reset", "step"]
+__all__ = ["legal_commands", "reset", "step", "step_groups", "steps_together"]
 
 
 def reset(key: Array, game: GameConfig) -> State:
@@ -59,6 +60,35 @@ def step(key: Array, state: State, commands: Commands, game: GameConfig) -> Step
     )
 
 
+def steps_together(games: Sequence[GameConfig]) -> bool:
+    return (
+        kernels.selected()
+        and len(games) > 1
+        and len({game.bucket for game in games}) == 1
+        and cycle.fits(games[0].bucket)
+    )
+
+
+def step_groups(requests: Sequence[tuple[Array, State, Commands, GameConfig]]) -> list[StepResult]:
+    if not steps_together([game for *_, game in requests]) or not all(
+        _kernel_can_step(key, game) for key, _, _, game in requests
+    ):
+        return [
+            jax.vmap(step, in_axes=(0, 0, 0, None))(key, state, commands, game)
+            for key, state, commands, game in requests
+        ]
+    results = [
+        jax.vmap(_t1_step, in_axes=(0, 0, 0, None))(key, state, commands, game)
+        for key, state, commands, game in requests
+    ]
+    return kernels.dispatch(
+        list(requests),
+        results,
+        kernel=_kernel_step_groups,
+        program=_precomputed_t1_results,
+    )
+
+
 def _kernel_can_step(key: Array, game: GameConfig) -> bool:
     if not cycle.fits(game.bucket):
         return False
@@ -86,6 +116,14 @@ def _precomputed_t1_result(key: Array, state: State, commands: Commands, game: G
 
 def _kernel_step(key: Array, state: State, commands: Commands, game: GameConfig, result: StepResult) -> StepResult:
     return cycle.on_device(key, state, commands, game)
+
+
+def _precomputed_t1_results(requests: list[tuple[Array, State, Commands, GameConfig]], results: list[StepResult]) -> list[StepResult]:
+    return results
+
+
+def _kernel_step_groups(requests: list[tuple[Array, State, Commands, GameConfig]], results: list[StepResult]) -> list[StepResult]:
+    return cycle.on_device_groups(requests)
 
 
 def _any_traced(*arguments: Any) -> bool:

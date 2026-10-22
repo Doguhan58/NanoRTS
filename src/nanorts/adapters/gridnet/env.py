@@ -19,7 +19,14 @@ from nanorts.adapters.lifecycle import (
     spawn_overflowed,
 )
 from nanorts.adapters.rewards import encode_rewards
-from nanorts.model import Commands, GameConfig, StepResult, Telemetry, board_view
+from nanorts.model import (
+    BoardView,
+    Commands,
+    GameConfig,
+    StepResult,
+    Telemetry,
+    board_view,
+)
 
 
 @jax.tree_util.register_dataclass
@@ -89,7 +96,9 @@ def _respond(environment_state: EnvironmentState, result: StepResult, game: Game
 
 def _ending(environment_state: EnvironmentState, result: StepResult, reward_components: Array, reward_dones: Array, *, game: GameConfig, layout: GridNetLayout, in_place: bool) -> GridNetStep:
     done = result.terminated | result.truncated
-    ordered = board_view(result.next_state, game) if in_place else None
+    ordered = (
+        _final_plane_fields(board_view(result.next_state, game)) if in_place else None
+    )
     carry = advance(environment_state, result, game, ordered=ordered)
     return GridNetStep(
         environment_state=carry,
@@ -105,3 +114,13 @@ def _ending(environment_state: EnvironmentState, result: StepResult, reward_comp
         final_observation=planes(result.next_state, game, layout=layout),
         final_valid=done,
     )
+
+
+def _final_plane_fields(board: BoardView) -> list[Array]:
+    return [
+        board.owner,
+        board.unit_type,
+        board.hit_points,
+        board.carried_resources,
+        board.pending_kind,
+    ]

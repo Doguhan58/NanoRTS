@@ -5,6 +5,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
 from nanorts import core, kernels
@@ -88,6 +89,10 @@ def select[Tree](taken: Array, at_boundary: Tree, otherwise: Tree) -> Tree:
 
 _RESET_TARGET = "nanorts_reset_where_done"
 
+_PACKED_RESET_TARGET = "nanorts_reset_packed_where_done"
+
+_PACKED_ROW_ALIGNMENT = 16
+
 _ROWS = tuple(
     field.name
     for field in model_fields(State)
@@ -102,16 +107,12 @@ def _reset_by_select(done: Array, reset: State, ending: State, ordered: Any) -> 
 
 def _reset_in_place(done: Array, reset: State, ending: State, ordered: Any) -> State:
     rows = [getattr(ending, name) for name in _ROWS]
+    target, reset_rows = _reset_operands(reset)
     written = kernels.call(
-        _RESET_TARGET,
-        [
-            done,
-            *(getattr(reset, name) for name in _ROWS),
-            *rows,
-            *jax.tree.leaves(ordered),
-        ],
+        target,
+        [done, *reset_rows, *rows, *jax.tree.leaves(ordered)],
         [jax.ShapeDtypeStruct(row.shape, row.dtype) for row in rows],
-        aliases={1 + len(_ROWS) + index: index for index in range(len(_ROWS))},
+        aliases={1 + len(reset_rows) + index: index for index in range(len(_ROWS))},
         attributes={"leaves": len(_ROWS)},
     )
     leaves: dict[str, Any] = {
@@ -123,6 +124,19 @@ def _reset_in_place(done: Array, reset: State, ending: State, ordered: Any) -> S
     }
     leaves.update(zip(_ROWS, written, strict=True))
     return dataclasses.replace(ending, **leaves)
+
+
+def _reset_operands(reset: State) -> tuple[str, list[Array]]:
+    rows = [getattr(reset, name) for name in _ROWS]
+    if any(isinstance(row, jax.core.Tracer) for row in rows):
+        return _RESET_TARGET, rows
+    packed = np.concatenate([_aligned_bytes(row) for row in rows])
+    return _PACKED_RESET_TARGET, [jnp.asarray(packed)]
+
+
+def _aligned_bytes(row: Array) -> np.ndarray:
+    data = np.asarray(row).reshape(-1).view(np.uint8)
+    return np.pad(data, (0, -data.size % _PACKED_ROW_ALIGNMENT))
 
 
 def refuse_decided(where: str, game: GameConfig) -> None:

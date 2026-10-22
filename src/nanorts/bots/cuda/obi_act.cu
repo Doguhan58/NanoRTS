@@ -12,7 +12,8 @@ using nanorts::whole_act::Extents;
 using nanorts::whole_act::Lanes;
 using nanorts::whole_act::StateRows;
 
-constexpr int64_t kBytesPerCell = 18;
+constexpr int64_t kBytesPerCell = 8;
+constexpr int64_t kBytesPerBoardWord = 68;
 constexpr int64_t kLaneBytes = 16;
 constexpr int64_t kBytesPerCandidate = 11;
 constexpr int64_t kBytesPerType = 4;
@@ -23,7 +24,7 @@ constexpr int32_t kLast = 2147483647;
 constexpr int32_t kAfterEveryAttack = 1073741824;
 constexpr int kDirections = 4;
 constexpr int32_t kNoneDuration = 10;
-constexpr int16_t kFar = 32767;
+constexpr int16_t kLargestFact = 32767;
 constexpr uint32_t kFullWarp = 0xffffffffu;
 constexpr uint32_t kTails = 0x80000000u;
 
@@ -67,15 +68,13 @@ constexpr int kCommandTargetCell = 3;
 constexpr int kCommandProducedType = 4;
 constexpr int kCommandRequestOrder = 5;
 
-constexpr int kAvailable = 0;
-constexpr int kKind = 1;
-constexpr int kMoveDirection = 2;
-constexpr int kHarvestDirection = 3;
-constexpr int kReturnDirection = 4;
-constexpr int kProduceDirection = 5;
-constexpr int kProduceType = 6;
-constexpr int kAttackOffset = 7;
-constexpr int kLegalityLeaves = 8;
+constexpr int32_t kWordBits = 32;
+constexpr int32_t kKinds = 6;
+constexpr int32_t kMoveColumn = kKinds;
+constexpr int32_t kHarvestColumn = kMoveColumn + kDirections;
+constexpr int32_t kReturnColumn = kHarvestColumn + kDirections;
+constexpr int32_t kProduceDirectionColumn = kReturnColumn + kDirections;
+constexpr int32_t kProduceTypeColumn = kProduceDirectionColumn + kDirections;
 
 constexpr int kOffsetAxes = 2;
 
@@ -96,12 +95,16 @@ constexpr uint8_t kMarked = 1;
 constexpr uint8_t kAccepted = 2;
 constexpr uint8_t kRemaining = 4;
 
+__host__ __device__ constexpr int32_t board_words(int64_t cells) {
+    return static_cast<int32_t>((cells + kWordBits - 1) / kWordBits);
+}
+
 constexpr int64_t shared_bytes(int64_t cells, int64_t capacity, int64_t candidates, int64_t types) {
-    return kBytesPerCell * cells + kLaneBytes + kBytesPerCandidate * candidates + kBytesPerType * types + kBytesPerSlot * capacity;
+    return kBytesPerCell * cells + kBytesPerBoardWord * board_words(cells) + kLaneBytes + kBytesPerCandidate * candidates + kBytesPerType * types + kBytesPerSlot * capacity;
 }
 
 struct Window {
-    int32_t kinds;
+    int32_t words;
     int32_t offsets;
     int32_t candidates;
 };
@@ -112,7 +115,7 @@ struct Inputs {
     Lanes<int32_t> table;
     Lanes<int32_t> player;
     Lanes<int32_t> none_duration;
-    Lanes<bool> legality[kLegalityLeaves];
+    Lanes<uint32_t> legality;
     Lanes<uint32_t> key;
     Lanes<int32_t> offsets;
     Lanes<int8_t> job;
@@ -137,6 +140,7 @@ struct Facts {
 };
 
 static_assert(sizeof(Facts) <= kLaneBytes, "the lane's facts outgrew their bytes");
+static_assert(nanorts::whole_act::kSharedOptInLimit / kBytesPerCell < kLargestFact, "a cell's fact outgrew int16");
 
 struct Shared {
     Facts* facts;
@@ -150,21 +154,25 @@ struct Shared {
     int32_t* score;
     int32_t* list_position;
     int32_t* unaffordable;
-    int16_t* distance;
+    uint32_t* frontier;
+    uint32_t* reached;
+    uint32_t* touched;
+    uint32_t* passable;
+    uint32_t* not_first;
+    uint32_t* not_last;
     int16_t* fact;
     int16_t* rewrite;
     int8_t* unit_type;
     int8_t* scored_as;
     uint8_t* slot;
-    uint8_t* target;
     uint8_t* around;
-    uint8_t* passable;
     uint8_t* candidate;
 
     __device__ static Shared carve(uint64_t* shared, const Extents& size, const Window& window) {
         const int32_t capacity = size.capacity;
         const int32_t cells = size.cells;
         const int32_t candidates = window.candidates;
+        const int32_t words = board_words(cells);
         Shared carved;
         char* const base = reinterpret_cast<char*>(shared);
         carved.facts = reinterpret_cast<Facts*>(base);
@@ -178,16 +186,19 @@ struct Shared {
         carved.score = carved.order + capacity;
         carved.list_position = carved.score + candidates;
         carved.unaffordable = carved.list_position + candidates;
-        carved.distance = reinterpret_cast<int16_t*>(carved.unaffordable + size.types);
-        carved.fact = carved.distance + kFields * cells;
+        carved.frontier = reinterpret_cast<uint32_t*>(carved.unaffordable + size.types);
+        carved.reached = carved.frontier + 2 * kFields * words;
+        carved.touched = carved.reached + kFields * words;
+        carved.passable = carved.touched + kFields * words;
+        carved.not_first = carved.passable + kFields * words;
+        carved.not_last = carved.not_first + words;
+        carved.fact = reinterpret_cast<int16_t*>(carved.not_last + words);
         carved.rewrite = carved.fact + kFields * cells;
         carved.unit_type = reinterpret_cast<int8_t*>(carved.rewrite + candidates);
         carved.scored_as = carved.unit_type + capacity;
         carved.slot = reinterpret_cast<uint8_t*>(carved.scored_as + capacity);
-        carved.target = carved.slot + capacity;
-        carved.around = carved.target + kFields * cells;
-        carved.passable = carved.around + 2 * cells;
-        carved.candidate = carved.passable + cells;
+        carved.around = carved.slot + capacity;
+        carved.candidate = carved.around + 2 * cells;
         return carved;
     }
 };
@@ -223,16 +234,16 @@ __device__ int32_t step_y(int32_t direction) {
     return known == 0 ? -1 : known == 2 ? 1 : 0;
 }
 
-__device__ int32_t stepped(int32_t cell, int32_t direction, const Extents& size, bool& on_board) {
-    const int32_t x = floor_mod(cell, size.width) + step_x(direction);
-    const int32_t y = floor_div(cell, size.width) + step_y(direction);
+__device__ int32_t stepped(int32_t column, int32_t row, int32_t direction, const Extents& size, bool& on_board) {
+    const int32_t x = column + step_x(direction);
+    const int32_t y = row + step_y(direction);
     on_board = x >= 0 && x < size.width && y >= 0 && y < size.height;
     return clip(y * size.width + x, 0, size.cells - 1);
 }
 
-__device__ int32_t window_target(int32_t cell, const int32_t* offset, const Extents& size) {
-    const int32_t x = floor_mod(cell, size.width) + offset[0];
-    const int32_t y = floor_div(cell, size.width) + offset[1];
+__device__ int32_t window_target(int32_t column, int32_t row, const int32_t* offset, const Extents& size) {
+    const int32_t x = column + offset[0];
+    const int32_t y = row + offset[1];
     const bool on_board = x >= 0 && x < size.width && y >= 0 && y < size.height;
     return on_board ? y * size.width + x : kAbsent;
 }
@@ -256,36 +267,65 @@ __device__ unsigned long long birth_key(int32_t birth, int32_t slot) {
 }
 
 __device__ int32_t warp_min(int32_t value) {
+#if __CUDA_ARCH__ >= 800
+    return __reduce_min_sync(kFullWarp, value);
+#else
     for (int distance = 16; distance > 0; distance >>= 1) {
         value = min(value, __shfl_xor_sync(kFullWarp, value, distance));
     }
 
     return value;
+#endif
 }
 
 __device__ int32_t warp_max(int32_t value) {
+#if __CUDA_ARCH__ >= 800
+    return __reduce_max_sync(kFullWarp, value);
+#else
     for (int distance = 16; distance > 0; distance >>= 1) {
         value = max(value, __shfl_xor_sync(kFullWarp, value, distance));
     }
 
     return value;
+#endif
 }
 
 __device__ unsigned long long warp_min(unsigned long long value) {
+#if __CUDA_ARCH__ >= 800
+    const uint32_t high = __reduce_min_sync(kFullWarp, static_cast<uint32_t>(value >> 32));
+    const uint32_t low = __reduce_min_sync(kFullWarp, static_cast<uint32_t>(value >> 32) == high ? static_cast<uint32_t>(value) : ~0u);
+    return static_cast<unsigned long long>(high) << 32 | low;
+#else
     for (int distance = 16; distance > 0; distance >>= 1) {
         const unsigned long long other = __shfl_xor_sync(kFullWarp, value, distance);
         value = other < value ? other : value;
     }
 
     return value;
+#endif
 }
 
 __device__ uint32_t warp_or(uint32_t value) {
+#if __CUDA_ARCH__ >= 800
+    return __reduce_or_sync(kFullWarp, value);
+#else
     for (int distance = 16; distance > 0; distance >>= 1) {
         value |= __shfl_xor_sync(kFullWarp, value, distance);
     }
 
     return value;
+#endif
+}
+
+__device__ int32_t in_direction(const int32_t (&values)[kDirections], int32_t direction) {
+    int32_t picked = values[0];
+
+#pragma unroll
+    for (int32_t other = 1; other < kDirections; ++other) {
+        picked = direction == other ? values[other] : picked;
+    }
+
+    return picked;
 }
 
 struct Candidate {
@@ -315,6 +355,10 @@ struct Candidate {
     }
 };
 
+__device__ bool is_set(const uint32_t* row, int32_t column) {
+    return (row[column / kWordBits] >> (column % kWordBits) & 1u) != 0u;
+}
+
 template <typename Slot, typename Cell>
 struct Lane {
     const int32_t* birth;
@@ -330,7 +374,7 @@ struct Lane {
     const int32_t* resources;
     const bool* terrain;
     const int32_t* table;
-    const bool* legality[kLegalityLeaves];
+    const uint32_t* legality;
     draw::Key key;
     const int32_t* offsets;
     int32_t player;
@@ -338,11 +382,7 @@ struct Lane {
     Extents size;
     Window window;
 
-    __device__ Lane(const Inputs<Slot, Cell>& in, int64_t lane, const Extents& extents, const Window& candidates) : birth(in.state.birth.at(lane)), unit_type(in.state.unit_type.at(lane)), owner(in.state.owner.at(lane)), cell(in.state.cell.at(lane)), carried(in.state.carried.at(lane)), pending_kind(in.state.pending_kind.at(lane)), pending_direction(in.state.pending_direction.at(lane)), pending_produced_type(in.state.pending_produced_type.at(lane)), none_duration(in.none_duration.at(lane)), entity_at(in.state.entity_at.at(lane)), resources(in.state.resources.at(lane)), terrain(in.state.terrain.at(lane)), table(in.table.at(lane)), key{in.key.at(lane)[0], in.key.at(lane)[1]}, offsets(in.offsets.at(lane)), player(in.player.at(lane)[0]), own(gathered(player, nanorts::whole_act::kPlayers)), size(extents), window(candidates) {
-        for (int k = 0; k < kLegalityLeaves; ++k) {
-            legality[k] = in.legality[k].at(lane);
-        }
-    }
+    __device__ Lane(const Inputs<Slot, Cell>& in, int64_t lane, const Extents& extents, const Window& candidates) : birth(in.state.birth.at(lane)), unit_type(in.state.unit_type.at(lane)), owner(in.state.owner.at(lane)), cell(in.state.cell.at(lane)), carried(in.state.carried.at(lane)), pending_kind(in.state.pending_kind.at(lane)), pending_direction(in.state.pending_direction.at(lane)), pending_produced_type(in.state.pending_produced_type.at(lane)), none_duration(in.none_duration.at(lane)), entity_at(in.state.entity_at.at(lane)), resources(in.state.resources.at(lane)), terrain(in.state.terrain.at(lane)), table(in.table.at(lane)), legality(in.legality.at(lane)), key{in.key.at(lane)[0], in.key.at(lane)[1]}, offsets(in.offsets.at(lane)), player(in.player.at(lane)[0]), own(gathered(player, nanorts::whole_act::kPlayers)), size(extents), window(candidates) {}
 
     __device__ int32_t at(int32_t type, int column) const {
         return table[clip(type, 0, size.types - 1) * kTableColumns + column];
@@ -352,8 +392,13 @@ struct Lane {
         return size.neutral + own * size.capacity + local;
     }
 
-    __device__ const bool* row(int leaf, int32_t local, int32_t width) const {
-        return legality[leaf] + (static_cast<int64_t>(own) * size.capacity + local) * width;
+    __device__ bool available(int32_t local) const {
+        const int32_t slot = own_slot(local);
+        return birth[slot] != kAbsent && pending_kind[slot] == kKindAbsent;
+    }
+
+    __device__ const uint32_t* row(int32_t local) const {
+        return legality + (static_cast<int64_t>(own) * size.capacity + local) * window.words;
     }
 
     __device__ const int32_t* offset(int32_t index) const {
@@ -361,19 +406,21 @@ struct Lane {
     }
 
     __device__ bool marked(int32_t local, const Candidate& candidate) const {
+        const uint32_t* words = row(local);
+
         switch (candidate.kind) {
             case kKindAttack:
-                return row(kAttackOffset, local, window.offsets)[candidate.offset];
+                return is_set(words, kProduceTypeColumn + size.types + candidate.offset);
             case kKindHarvest:
-                return row(kHarvestDirection, local, kDirections)[candidate.direction];
+                return is_set(words, kHarvestColumn + candidate.direction);
             case kKindReturn:
-                return row(kReturnDirection, local, kDirections)[candidate.direction];
+                return is_set(words, kReturnColumn + candidate.direction);
             case kKindProduce:
-                return row(kProduceType, local, size.types)[candidate.produced_type] && row(kProduceDirection, local, kDirections)[candidate.direction];
+                return is_set(words, kProduceTypeColumn + candidate.produced_type) && is_set(words, kProduceDirectionColumn + candidate.direction);
             case kKindMove:
-                return row(kMoveDirection, local, kDirections)[candidate.direction];
+                return is_set(words, kMoveColumn + candidate.direction);
             default:
-                return row(kKind, local, window.kinds)[kKindNone];
+                return is_set(words, kKindNone);
         }
     }
 };
@@ -394,20 +441,15 @@ __device__ uint8_t units_around(const Lane<Slot, Cell>& lane, int32_t cell, int 
 }
 
 template <typename Slot, typename Cell>
-__device__ void read_slots_and_cells(const Lane<Slot, Cell>& lane, const Inputs<Slot, Cell>& in, const Shared& shared, int64_t lane_index) {
+__device__ void read_slots(const Lane<Slot, Cell>& lane, const Inputs<Slot, Cell>& in, const Shared& shared, int64_t lane_index) {
     const Extents& size = lane.size;
 
     if (threadIdx.x == 0) {
         *shared.facts = Facts{0, 1, 0u, 0u};
     }
 
-    for (int32_t cell = threadIdx.x; cell < size.cells; cell += blockDim.x) {
-        for (int field = 0; field < kFields; ++field) {
-            shared.target[field * size.cells + cell] = 0;
-        }
-
-        shared.around[cell] = units_around(lane, cell, kBuildSiteRadius);
-        shared.around[size.cells + cell] = units_around(lane, cell, kBaseSiteRadius);
+    for (int32_t word = threadIdx.x; word < kFields * board_words(size.cells); word += blockDim.x) {
+        shared.frontier[word] = 0u;
     }
 
     const int32_t local = threadIdx.x;
@@ -420,12 +462,12 @@ __device__ void read_slots_and_cells(const Lane<Slot, Cell>& lane, const Inputs<
     const int32_t birth = lane.birth[slot];
     const int32_t cell = static_cast<int32_t>(lane.cell[slot]);
     const int32_t type = lane.unit_type[slot];
-    const bool available = lane.row(kAvailable, local, 1)[0];
+    const bool available = lane.available(local);
     const int32_t kind = lane.pending_kind[slot];
     const bool busy = birth != kAbsent && kind != kKindAbsent;
     const int32_t parameter = kind == kKindNone ? lane.none_duration[slot] : directional(kind) ? lane.pending_direction[slot] : kAbsent;
     bool on_board = false;
-    const int32_t claim_cell = stepped(cell, parameter, size, on_board);
+    const int32_t claim_cell = stepped(floor_mod(cell, size.width), floor_div(cell, size.width), parameter, size, on_board);
     const bool claims = busy && parameter >= 0 && parameter < kDirections && on_board;
     const bool produces = busy && kind == kKindProduce;
     const int32_t produced = clip(lane.pending_produced_type[slot], 0, size.types - 1);
@@ -438,6 +480,31 @@ __device__ void read_slots_and_cells(const Lane<Slot, Cell>& lane, const Inputs<
     shared.chosen[local] = kAbsent;
     shared.unit_type[local] = static_cast<int8_t>(type);
     shared.slot[local] = (available ? kSlotAvailable : 0) | (lane.carried[slot] > 0 ? kSlotCarrying : 0) | (gives ? kSlotGives : 0) | (claims ? kSlotClaims : 0) | (produces ? kSlotProduces : 0) | (type == kTypeBase ? kSlotBase : 0);
+}
+
+template <typename Slot, typename Cell>
+__device__ void count_sites(const Lane<Slot, Cell>& lane, const Shared& shared) {
+    const Extents& size = lane.size;
+
+    for (int32_t cell = threadIdx.x; cell < size.cells; cell += blockDim.x) {
+        shared.around[cell] = units_around(lane, cell, kBuildSiteRadius);
+        shared.around[size.cells + cell] = units_around(lane, cell, kBaseSiteRadius);
+    }
+}
+
+template <typename Slot, typename Cell>
+__device__ void keep_jobs(const Lane<Slot, Cell>& lane, const Inputs<Slot, Cell>& in, const Outputs& out, int64_t lane_index) {
+    const int32_t local = threadIdx.x;
+
+    if (local < lane.size.capacity) {
+        const int64_t row = lane_index * lane.size.capacity + local;
+        out.job[row] = in.job.at(lane_index)[local];
+        out.holder[row] = in.holder.at(lane_index)[local];
+    }
+}
+
+__device__ void mark_target(const Shared& shared, int field, int32_t cell, int32_t cells) {
+    atomicOr(&shared.frontier[field * board_words(cells) + cell / kWordBits], 1u << (cell % kWordBits));
 }
 
 template <typename Slot, typename Cell>
@@ -467,15 +534,15 @@ __device__ void mark_targets_and_give_jobs(const Lane<Slot, Cell>& lane, const I
         }
 
         if (owner == 1 - lane.player) {
-            shared.target[kEnemy * size.cells + cell] = 1;
+            mark_target(shared, kEnemy, cell, size.cells);
         }
 
         if (type == kTypeResource && owner == kOwnerNeutral) {
-            shared.target[kResource * size.cells + cell] = 1;
+            mark_target(shared, kResource, cell, size.cells);
         }
 
         if (type == kTypeBase && owner == lane.player) {
-            shared.target[kOwnBase * size.cells + cell] = 1;
+            mark_target(shared, kOwnBase, cell, size.cells);
         }
     }
 
@@ -528,51 +595,120 @@ __device__ void mark_targets_and_give_jobs(const Lane<Slot, Cell>& lane, const I
     shared.scored_as[local] = static_cast<int8_t>(clip(worker ? job : next_job, 0, kJobCount - 1));
 }
 
-__device__ bool passable(const Shared& shared, int field, int32_t cell) {
-    return (shared.passable[cell] >> field & 1) != 0;
+template <bool kOpenOnly>
+__device__ uint32_t board_word(const uint32_t* board, const uint32_t* open, int32_t word, int32_t words) {
+    if (word < 0 || word >= words) {
+        return 0u;
+    }
+
+    return kOpenOnly ? board[word] & open[word] : board[word];
+}
+
+template <bool kOpenOnly>
+__device__ uint32_t neighbours(const uint32_t* board, const uint32_t* open, int32_t word, const Extents& size, uint32_t not_first, uint32_t not_last) {
+    const int32_t words = board_words(size.cells);
+    const int32_t rows = size.width / kWordBits;
+    const int32_t shift = size.width % kWordBits;
+    const uint32_t before = board_word<kOpenOnly>(board, open, word - 1, words);
+    const uint32_t here = board_word<kOpenOnly>(board, open, word, words);
+    const uint32_t after = board_word<kOpenOnly>(board, open, word + 1, words);
+    uint32_t from_above = __funnelshift_l(before, here, shift);
+    uint32_t from_below = __funnelshift_r(here, after, shift);
+
+    if (rows > 0) {
+        from_above = __funnelshift_l(board_word<kOpenOnly>(board, open, word - rows - 1, words), board_word<kOpenOnly>(board, open, word - rows, words), shift);
+        from_below = __funnelshift_r(board_word<kOpenOnly>(board, open, word + rows, words), board_word<kOpenOnly>(board, open, word + rows + 1, words), shift);
+    }
+
+    const uint32_t from_left = __funnelshift_l(before, here, 1) & not_first;
+    const uint32_t from_right = __funnelshift_r(here, after, 1) & not_last;
+    return from_above | from_below | from_left | from_right;
+}
+
+__device__ int32_t board_field(int32_t board, int32_t words) {
+    int32_t field = 0;
+
+    for (int later = 1; later < kFields; ++later) {
+        field += board >= later * words;
+    }
+
+    return field;
+}
+
+template <typename Slot, typename Cell>
+__device__ void load_boards(const Lane<Slot, Cell>& lane, const Shared& shared) {
+    const Extents& size = lane.size;
+    const int32_t words = board_words(size.cells);
+    const int32_t bit = static_cast<int32_t>(threadIdx.x) % kWordBits;
+    const int16_t unreached = static_cast<int16_t>(size.cells + 1);
+
+    for (int32_t first = static_cast<int32_t>(threadIdx.x) - bit; first < words * kWordBits; first += blockDim.x) {
+        const int32_t cell = first + bit;
+        const int32_t word = first / kWordBits;
+        const bool inside = cell < size.cells;
+        const int32_t column = inside ? cell % size.width : 0;
+        const bool open = inside && !lane.terrain[cell];
+        const bool empty = inside && static_cast<int32_t>(lane.entity_at[cell]) == kAbsent;
+        const uint32_t not_first = __ballot_sync(kFullWarp, inside && column != 0);
+        const uint32_t not_last = __ballot_sync(kFullWarp, inside && column != size.width - 1);
+
+        for (int field = 0; field < kFields; ++field) {
+            const uint32_t targets = shared.frontier[field * words + word];
+            const bool target = (targets >> bit & 1u) != 0u;
+            const uint32_t through = __ballot_sync(kFullWarp, open && (empty || target));
+
+            if (bit == 0) {
+                shared.passable[field * words + word] = through;
+                shared.reached[field * words + word] = through & targets;
+                shared.touched[field * words + word] = 0u;
+            }
+
+            if (inside) {
+                shared.fact[field * size.cells + cell] = unreached;
+            }
+        }
+
+        if (bit == 0) {
+            shared.not_first[word] = not_first;
+            shared.not_last[word] = not_last;
+        }
+    }
 }
 
 template <typename Slot, typename Cell>
 __device__ void measure_distances(const Lane<Slot, Cell>& lane, const Shared& shared) {
     const Extents& size = lane.size;
-
-    for (int32_t cell = threadIdx.x; cell < size.cells; cell += blockDim.x) {
-        const bool open = !lane.terrain[cell];
-        const bool empty = static_cast<int32_t>(lane.entity_at[cell]) == kAbsent;
-        uint8_t bits = 0;
-
-        for (int field = 0; field < kFields; ++field) {
-            const bool target = shared.target[field * size.cells + cell] != 0;
-            const bool through = open && (empty || target);
-            bits |= static_cast<uint8_t>(through) << field;
-            shared.distance[field * size.cells + cell] = through && target ? 0 : kFar;
-        }
-
-        shared.passable[cell] = bits;
-    }
-
+    const int32_t words = board_words(size.cells);
+    const int32_t boards = kFields * words;
+    load_boards(lane, shared);
     __syncthreads();
 
-    for (int16_t level = 0;; ++level) {
+    for (int32_t level = 0;; ++level) {
+        const uint32_t* const frontier = shared.frontier + (level & 1) * boards;
+        uint32_t* const next_frontier = shared.frontier + ((level + 1) & 1) * boards;
         bool grew = false;
 
-        for (int32_t cell = threadIdx.x; cell < size.cells; cell += blockDim.x) {
-            for (int field = 0; field < kFields; ++field) {
-                const bool seeds = level == 0 && shared.target[field * size.cells + cell] != 0;
+        for (int32_t board = threadIdx.x; board < boards; board += blockDim.x) {
+            const int32_t field = board_field(board, words);
+            const int32_t word = board - field * words;
+            const uint32_t* const field_frontier = frontier + field * words;
+            const uint32_t not_first = shared.not_first[word];
+            const uint32_t not_last = shared.not_last[word];
+            const uint32_t grown = neighbours<false>(field_frontier, nullptr, word, size, not_first, not_last);
+            const uint32_t measured = level == 0 ? neighbours<true>(field_frontier, shared.passable + field * words, word, size, not_first, not_last) : grown;
+            const uint32_t touched = shared.touched[board];
+            const uint32_t reached = shared.reached[board];
+            const uint32_t fresh = grown & shared.passable[board] & ~reached;
+            shared.touched[board] = touched | measured;
+            shared.reached[board] = reached | fresh;
+            next_frontier[board] = fresh;
+            grew = grew || fresh != 0u;
 
-                if (shared.distance[field * size.cells + cell] != level && !seeds) {
-                    continue;
-                }
+            for (uint32_t first_touch = measured & ~touched; first_touch != 0u; first_touch &= first_touch - 1u) {
+                const int32_t cell = word * kWordBits + __ffs(static_cast<int>(first_touch)) - 1;
 
-                for (int32_t direction = 0; direction < kDirections; ++direction) {
-                    bool on_board = false;
-                    const int32_t next = stepped(cell, direction, size, on_board);
-                    int16_t& reached = shared.distance[field * size.cells + next];
-
-                    if (on_board && passable(shared, field, next) && reached == kFar) {
-                        reached = static_cast<int16_t>(level + 1);
-                        grew = true;
-                    }
+                if (cell < size.cells) {
+                    shared.fact[field * size.cells + cell] = static_cast<int16_t>(level + 1);
                 }
             }
         }
@@ -581,37 +717,26 @@ __device__ void measure_distances(const Lane<Slot, Cell>& lane, const Shared& sh
             break;
         }
     }
-
-    for (int32_t cell = threadIdx.x; cell < size.cells; cell += blockDim.x) {
-        for (int field = 0; field < kFields; ++field) {
-            int32_t nearest = kFar;
-
-            for (int32_t direction = 0; direction < kDirections; ++direction) {
-                bool on_board = false;
-                const int32_t next = stepped(cell, direction, size, on_board);
-
-                if (on_board) {
-                    nearest = min(nearest, int32_t{shared.distance[field * size.cells + next]});
-                }
-            }
-
-            shared.fact[field * size.cells + cell] = static_cast<int16_t>(nearest < kFar ? nearest + 1 : size.cells + 1);
-        }
-    }
 }
 
 struct Unit {
     int32_t slot;
     bool available;
     int32_t cell;
+    int32_t x;
+    int32_t y;
     int32_t type;
+    bool fights;
     bool carrying;
     int32_t scored_as;
 };
 
+__device__ int32_t neighbour(const Unit& unit, int32_t direction, const Extents& size) {
+    bool on_board = false;
+    return stepped(unit.x, unit.y, direction, size, on_board);
+}
+
 struct Around {
-    int32_t neighbour[kDirections];
-    bool on_board[kDirections];
     uint32_t planned;
     uint32_t claimed;
     int32_t first_position[kDirections];
@@ -620,14 +745,18 @@ struct Around {
 };
 
 template <typename Slot, typename Cell>
-__device__ Around around(const Lane<Slot, Cell>& lane, const Shared& shared, const Unit& unit) {
+__device__ Around around(const Lane<Slot, Cell>& lane, const Shared& shared, const Unit& unit, bool can_produce) {
     const Extents& size = lane.size;
     Around found{};
+    int32_t neighbours[kDirections];
+    bool on_board[kDirections];
     unsigned long long rewrite_key[kDirections];
 
+#pragma unroll
     for (int32_t direction = 0; direction < kDirections; ++direction) {
-        found.neighbour[direction] = stepped(unit.cell, direction, size, found.on_board[direction]);
+        neighbours[direction] = stepped(unit.x, unit.y, direction, size, on_board[direction]);
         found.first_position[direction] = kLast;
+        found.first_rewrite[direction] = kLast;
         rewrite_key[direction] = ~0ull;
     }
 
@@ -642,15 +771,15 @@ __device__ Around around(const Lane<Slot, Cell>& lane, const Shared& shared, con
         const int32_t claim_cell = shared.claim_cell[slot];
         const int32_t birth = shared.birth[slot];
 
+#pragma unroll
         for (int32_t direction = 0; direction < kDirections; ++direction) {
-            const bool on_board = found.on_board[direction];
-            const int32_t neighbour = found.neighbour[direction];
+            const int32_t neighbour = neighbours[direction];
 
-            if (on_board && claimed == neighbour) {
+            if (on_board[direction] && claimed == neighbour) {
                 found.planned |= 1u << direction;
             }
 
-            if (claims && claim_cell == neighbour && on_board) {
+            if (claims && claim_cell == neighbour && on_board[direction]) {
                 found.claimed |= 1u << direction;
                 found.first_position[direction] = min(found.first_position[direction], birth);
             } else if (pair) {
@@ -663,14 +792,24 @@ __device__ Around around(const Lane<Slot, Cell>& lane, const Shared& shared, con
         }
     }
 
-    found.planned = warp_or(found.planned);
-    found.claimed = warp_or(found.claimed);
+    const uint32_t marks = warp_or(found.planned | found.claimed << kDirections);
+    found.planned = marks & ((1u << kDirections) - 1u);
+    found.claimed = marks >> kDirections;
 
-    for (int32_t direction = 0; direction < kDirections; ++direction) {
-        found.first_position[direction] = warp_min(found.first_position[direction]);
-        const unsigned long long key = warp_min(rewrite_key[direction]);
-        found.first_rewrite[direction] = key == ~0ull ? kLast : static_cast<int32_t>(static_cast<uint32_t>(key >> 32) ^ 0x80000000u);
-        found.rewrite_slot[direction] = key == ~0ull ? 0 : static_cast<int32_t>(key & 0xffffffffu);
+    if (can_produce) {
+#pragma unroll
+        for (int32_t direction = 0; direction < kDirections; ++direction) {
+            found.first_position[direction] = warp_min(found.first_position[direction]);
+        }
+    }
+
+    if (can_produce && barracks) {
+#pragma unroll
+        for (int32_t direction = 0; direction < kDirections; ++direction) {
+            const unsigned long long key = warp_min(rewrite_key[direction]);
+            found.first_rewrite[direction] = key == ~0ull ? kLast : static_cast<int32_t>(static_cast<uint32_t>(key >> 32) ^ 0x80000000u);
+            found.rewrite_slot[direction] = key == ~0ull ? 0 : static_cast<int32_t>(key & 0xffffffffu);
+        }
     }
 
     return found;
@@ -681,8 +820,13 @@ __device__ void first_unaffordable(const Lane<Slot, Cell>& lane, const Shared& s
     const Extents& size = lane.size;
     const int32_t balance = lane.resources[lane.own];
     const bool barracks = unit.type == kTypeBarracks;
+    const uint32_t* words = lane.row(unit.slot);
 
     for (int32_t type = 0; type < size.types; ++type) {
+        if (!is_set(words, kProduceTypeColumn + type)) {
+            continue;
+        }
+
         const int32_t price = lane.at(type, kCost);
         int32_t first = kLast;
 
@@ -733,10 +877,9 @@ __device__ int32_t scored(const Lane<Slot, Cell>& lane, const Shared& shared, co
         return shared.around[size.cells + facts_cell];
     }
 
-    const bool fights = lane.at(unit.type, kCanAttack) != 0 && lane.at(unit.type, kCanHarvest) == 0;
     const int32_t soldier = idle || produce ? worst : attack ? kSoldierAttackScore : -enemy;
 
-    if (fights) {
+    if (unit.fights) {
         return soldier;
     }
 
@@ -789,9 +932,9 @@ __device__ void judge(const Lane<Slot, Cell>& lane, const Shared& shared, const 
         int32_t target_cell = kAbsent;
 
         if (candidate.kind == kKindAttack) {
-            target_cell = window_target(unit.cell, lane.offset(candidate.offset), size);
+            target_cell = window_target(unit.x, unit.y, lane.offset(candidate.offset), size);
         } else if (candidate.direction != kAbsent) {
-            target_cell = found.neighbour[known];
+            target_cell = neighbour(unit, known, size);
         }
 
         const int32_t facts_cell = clip(target_cell, 0, size.cells - 1);
@@ -811,12 +954,13 @@ __device__ void judge(const Lane<Slot, Cell>& lane, const Shared& shared, const 
         bool rejected = planned || (found.claimed >> known & 1u) != 0;
         int32_t rewrite = kAbsent;
 
-        if (candidate.kind == kKindProduce) {
-            const int32_t first_reject = min(found.first_position[known], shared.unaffordable[candidate.produced_type]);
-            rejected = planned || first_reject < found.first_rewrite[known];
+        if (candidate.kind == kKindProduce && marked) {
+            const int32_t first_rewrite = in_direction(found.first_rewrite, known);
+            const int32_t first_reject = min(in_direction(found.first_position, known), shared.unaffordable[candidate.produced_type]);
+            rejected = planned || first_reject < first_rewrite;
 
-            if (!planned && found.first_rewrite[known] < first_reject) {
-                rewrite = found.rewrite_slot[known];
+            if (!planned && first_rewrite < first_reject) {
+                rewrite = in_direction(found.rewrite_slot, known);
             }
         }
 
@@ -842,9 +986,10 @@ __device__ void judge(const Lane<Slot, Cell>& lane, const Shared& shared, const 
     __syncwarp();
 }
 
-__device__ int32_t drawn(const Shared& shared, const Window& window, draw::Key key) {
+__device__ int32_t drawn(const Shared& shared, const Window& window, draw::Key key, int32_t local, uint32_t attempt, bool& left) {
     int32_t first = kLast;
-    uint32_t any = 0;
+    int32_t lowest = window.candidates;
+    int32_t held = 0;
 
     for (int32_t index = threadIdx.x; index < window.candidates; index += nanorts::whole_act::kWarp) {
         if ((shared.candidate[index] & kRemaining) == 0) {
@@ -852,15 +997,19 @@ __device__ int32_t drawn(const Shared& shared, const Window& window, draw::Key k
         }
 
         first = min(first, shared.list_position[index]);
-        any = 1;
+        lowest = min(lowest, index);
+        ++held;
+    }
+
+    const uint32_t holders = __ballot_sync(kFullWarp, held > 0);
+    left = __popc(holders) > 1 || __any_sync(kFullWarp, held > 1);
+
+    if (!left) {
+        return holders == 0u ? kAbsent : __shfl_sync(kFullWarp, lowest, __ffs(static_cast<int>(holders)) - 1);
     }
 
     first = warp_min(first);
-
-    if (warp_or(any) == 0) {
-        return kAbsent;
-    }
-
+    const draw::Key attempt_key = draw::split(draw::split(key, static_cast<uint32_t>(local)), attempt);
     int32_t latest = -1;
 
     for (int32_t index = threadIdx.x; index < window.candidates; index += nanorts::whole_act::kWarp) {
@@ -869,9 +1018,8 @@ __device__ int32_t drawn(const Shared& shared, const Window& window, draw::Key k
         }
 
         const int32_t list_position = shared.list_position[index];
-        const bool heads = (draw::bits(key, static_cast<uint32_t>(index)) & kTails) == 0u;
 
-        if (heads || list_position == first) {
+        if (list_position == first || (draw::bits(attempt_key, static_cast<uint32_t>(index)) & kTails) == 0u) {
             latest = max(latest, list_position);
         }
     }
@@ -897,32 +1045,41 @@ __device__ void walk(const Lane<Slot, Cell>& lane, const Shared& shared) {
     for (int32_t position = 0; position < visits; ++position) {
         const int32_t local = shared.order[position];
         const uint8_t flags = shared.slot[local];
-        const Unit unit{local, (flags & kSlotAvailable) != 0, shared.cell[local], shared.unit_type[local], (flags & kSlotCarrying) != 0, shared.scored_as[local]};
-        const Around found = around(lane, shared, unit);
-        first_unaffordable(lane, shared, unit);
+        const int32_t cell = shared.cell[local];
+        const int32_t type = shared.unit_type[local];
+        const bool fights = lane.at(type, kCanAttack) != 0 && lane.at(type, kCanHarvest) == 0;
+        const Unit unit{local, (flags & kSlotAvailable) != 0, cell, floor_mod(cell, size.width), floor_div(cell, size.width), type, fights, (flags & kSlotCarrying) != 0, shared.scored_as[local]};
+        const uint32_t* words = lane.row(local);
+        bool marked_type = false;
+
+        for (int32_t produced = threadIdx.x; produced < size.types; produced += nanorts::whole_act::kWarp) {
+            marked_type = marked_type || is_set(words, kProduceTypeColumn + produced);
+        }
+
+        const bool can_produce = __any_sync(kFullWarp, marked_type);
+        const Around found = around(lane, shared, unit, can_produce);
+
+        if (can_produce) {
+            first_unaffordable(lane, shared, unit);
+        }
+
         judge(lane, shared, unit, found);
-        const draw::Key unit_key = draw::split(lane.key, static_cast<uint32_t>(local));
 
         for (uint32_t attempt = 0;; ++attempt) {
-            const int32_t chosen = drawn(shared, lane.window, draw::split(unit_key, attempt));
-
-            if (chosen != kAbsent && static_cast<int32_t>(threadIdx.x) == chosen % nanorts::whole_act::kWarp) {
-                shared.candidate[chosen] &= static_cast<uint8_t>(~kRemaining);
-            }
-
-            __syncwarp();
-            uint32_t left = 0;
-
-            for (int32_t index = threadIdx.x; index < lane.window.candidates; index += nanorts::whole_act::kWarp) {
-                left |= (shared.candidate[index] & kRemaining) != 0;
-            }
-
-            const bool remaining = warp_or(left) != 0;
+            bool left = false;
+            const int32_t chosen = drawn(shared, lane.window, lane.key, local, attempt, left);
             const int32_t settled_choice = unit.available ? chosen : kAbsent;
             const int32_t known = clip(settled_choice, 0, lane.window.candidates - 1);
             const bool refused = settled_choice == kAbsent || (shared.candidate[known] & kAccepted) == 0;
 
-            if (refused && remaining) {
+            if (refused && left) {
+                __syncwarp();
+
+                if (static_cast<int32_t>(threadIdx.x) == chosen % nanorts::whole_act::kWarp) {
+                    shared.candidate[chosen] &= static_cast<uint8_t>(~kRemaining);
+                }
+
+                __syncwarp();
                 continue;
             }
 
@@ -931,7 +1088,7 @@ __device__ void walk(const Lane<Slot, Cell>& lane, const Shared& shared) {
                 shared.chosen[local] = settled_choice;
 
                 if (settled_choice != kAbsent && directional(candidate.kind)) {
-                    shared.claimed[local] = found.neighbour[clip(candidate.direction, 0, kDirections - 1)];
+                    shared.claimed[local] = neighbour(unit, clip(candidate.direction, 0, kDirections - 1), size);
                 }
 
                 const int32_t rewrite = shared.rewrite[known];
@@ -954,13 +1111,14 @@ __device__ void write_commands(const Lane<Slot, Cell>& lane, const Shared& share
     const Extents& size = lane.size;
     const int32_t local = threadIdx.x;
     const int32_t chosen = shared.chosen[local];
+    const int32_t cell = shared.cell[local];
     const bool issued = chosen != kAbsent;
     const Candidate candidate(clip(chosen, 0, lane.window.candidates - 1), lane.window, size.types);
     int32_t command[kCommandFields];
     command[kCommandKind] = issued ? candidate.kind : kKindAbsent;
     command[kCommandDirection] = issued ? candidate.direction : kAbsent;
     command[kCommandNoneDuration] = issued && candidate.kind == kKindNone ? kNoneDuration : 0;
-    command[kCommandTargetCell] = issued && candidate.kind == kKindAttack ? window_target(shared.cell[local], lane.offset(candidate.offset), size) : kAbsent;
+    command[kCommandTargetCell] = issued && candidate.kind == kKindAttack ? window_target(floor_mod(cell, size.width), floor_div(cell, size.width), lane.offset(candidate.offset), size) : kAbsent;
     command[kCommandProducedType] = issued ? candidate.produced_type : kAbsent;
     command[kCommandRequestOrder] = kAbsent;
     int32_t unissued[kCommandFields];
@@ -985,24 +1143,29 @@ __global__ void __launch_bounds__(nanorts::whole_act::kMaxThreads) act_kernel(In
     const int64_t lane_index = blockIdx.x;
     const Lane<Slot, Cell> lane(in, lane_index, size, window);
     const Shared shared = Shared::carve(memory, size, window);
-    read_slots_and_cells(lane, in, shared, lane_index);
-    __syncthreads();
-    mark_targets_and_give_jobs(lane, in, out, shared, lane_index);
-    __syncthreads();
-    measure_distances(lane, shared);
+    read_slots(lane, in, shared, lane_index);
+    const bool own_available = static_cast<int32_t>(threadIdx.x) < size.capacity && (shared.slot[threadIdx.x] & kSlotAvailable) != 0;
+
+    if (__syncthreads_or(own_available) != 0) {
+        count_sites(lane, shared);
+        mark_targets_and_give_jobs(lane, in, out, shared, lane_index);
+        __syncthreads();
+        measure_distances(lane, shared);
+        __syncthreads();
+
+        if (threadIdx.x < nanorts::whole_act::kWarp) {
+            walk(lane, shared);
+        }
+
+        __syncthreads();
+    } else {
+        keep_jobs(lane, in, out, lane_index);
+    }
 
     if (threadIdx.x == 0) {
         out.harvester_given[lane_index] = in.harvester_given.at(lane_index)[0] || shared.facts->harvester_given != 0u;
         out.builder_given[lane_index] = in.builder_given.at(lane_index)[0] || shared.facts->builder_given != 0u;
     }
-
-    __syncthreads();
-
-    if (threadIdx.x < nanorts::whole_act::kWarp) {
-        walk(lane, shared);
-    }
-
-    __syncthreads();
 
     if (static_cast<int32_t>(threadIdx.x) < size.capacity) {
         write_commands(lane, shared, out.commands, lane_index);
@@ -1030,12 +1193,9 @@ ffi::Error launch(cudaStream_t stream, nanorts::whole_act::Operands& operands, c
     }
 
     const int64_t rows = int64_t{nanorts::whole_act::kPlayers} * size.capacity;
-    const int64_t widths[kLegalityLeaves] = {1, window.kinds, kDirections, kDirections, kDirections, kDirections, size.types, window.offsets};
 
-    for (int k = 0; k < kLegalityLeaves; ++k) {
-        if (auto e = operands.next(rows * widths[k], in.legality[k]); e.failure()) {
-            return e;
-        }
+    if (auto e = operands.next(rows * window.words, in.legality); e.failure()) {
+        return e;
     }
 
     if (auto e = operands.next(int64_t{2}, in.key); e.failure()) {
@@ -1064,42 +1224,35 @@ ffi::Error launch(cudaStream_t stream, nanorts::whole_act::Operands& operands, c
 
     const int threads = nanorts::whole_act::threads_for(size.capacity);
     const int64_t shared = shared_bytes(size.cells, size.capacity, window.candidates, size.types);
+    static nanorts::whole_act::SharedOptIn opt_in;
+
+    if (auto e = opt_in.allow(operands, nanorts::kernel(act_kernel<Slot, Cell>), shared); e.failure()) {
+        return e;
+    }
+
     act_kernel<Slot, Cell><<<static_cast<unsigned>(lanes), threads, static_cast<size_t>(shared), stream>>>(in, outputs, size, window);
     return nanorts::launched();
 }
 
 constexpr int64_t kNoneDurationOperand = nanorts::whole_act::kStateOperands + 2;
 constexpr int64_t kLegalityOperand = kNoneDurationOperand + 1;
-constexpr int64_t kKeyOperand = kLegalityOperand + kLegalityLeaves;
+constexpr int64_t kKeyOperand = kLegalityOperand + 1;
 constexpr int64_t kOffsetsOperand = kKeyOperand + 1;
 constexpr int64_t kReadOperands = kOffsetsOperand + 1;
 constexpr int64_t kCarryLeaves = 4;
 
 ffi::Error check_extras(const nanorts::whole_act::Operands& operands, int64_t capacity, int64_t types, Window& window) {
-    for (int k = 0; k < kLegalityLeaves; ++k) {
-        auto leaf = operands.at(kLegalityOperand + k);
-
-        if (!leaf.has_value()) {
-            return leaf.error();
-        }
-
-        const auto dimensions = leaf->dimensions();
-
-        if (leaf->element_type() != ffi::DataType::PRED || dimensions.size() != (k == kAvailable ? 3u : 4u) || dimensions[1] != nanorts::whole_act::kPlayers || dimensions[2] != capacity) {
-            return operands.refused("Legality leaf " + std::to_string(k) + " is not `[lanes, 2, C, ...]` bool");
-        }
-    }
-
-    window.kinds = static_cast<int32_t>(operands.at(kLegalityOperand + kKind)->dimensions()[3]);
-    window.offsets = static_cast<int32_t>(operands.at(kLegalityOperand + kAttackOffset)->dimensions()[3]);
-    const int64_t produced = operands.at(kLegalityOperand + kProduceType)->dimensions()[3];
-    window.candidates = window.offsets + 2 * kDirections + kDirections * static_cast<int32_t>(types) + kDirections + 1;
     auto none_duration = operands.at(kNoneDurationOperand);
+    auto words = operands.at(kLegalityOperand);
     auto key = operands.at(kKeyOperand);
     auto offsets = operands.at(kOffsetsOperand);
 
     if (!none_duration.has_value()) {
         return none_duration.error();
+    }
+
+    if (!words.has_value()) {
+        return words.error();
     }
 
     if (!key.has_value()) {
@@ -1110,10 +1263,25 @@ ffi::Error check_extras(const nanorts::whole_act::Operands& operands, int64_t ca
         return offsets.error();
     }
 
-    if (window.kinds <= kKindNone || window.offsets <= 0 || produced != types || none_duration->element_type() != ffi::DataType::S32 || key->element_type() != ffi::DataType::U32 || offsets->element_type() != ffi::DataType::S32) {
-        return operands.refused(
-            "the Pending NONE durations are int32, the key uint32 data and the attack offsets "
-            "int32, over a Legality grid of the table's types");
+    const auto steps = offsets->dimensions();
+
+    if (offsets->element_type() != ffi::DataType::S32 || steps.size() != 3u || steps[1] <= 0 || steps[2] != kOffsetAxes) {
+        return operands.refused("the attack offsets are `[1, O, 2]` int32");
+    }
+
+    window.offsets = static_cast<int32_t>(steps[1]);
+    window.candidates = window.offsets + 2 * kDirections + kDirections * static_cast<int32_t>(types) + kDirections + 1;
+    const int64_t columns = kProduceTypeColumn + types + window.offsets;
+    const auto rows = words->dimensions();
+
+    if (words->element_type() != ffi::DataType::U32 || rows.size() != 4u || rows[1] != nanorts::whole_act::kPlayers || rows[2] != capacity || rows[3] != (columns + kWordBits - 1) / kWordBits) {
+        return operands.refused("the Legality words are `[lanes, 2, C, W]` uint32, with W words holding a row of the table's types and offsets");
+    }
+
+    window.words = static_cast<int32_t>(rows[3]);
+
+    if (none_duration->element_type() != ffi::DataType::S32 || key->element_type() != ffi::DataType::U32) {
+        return operands.refused("the Pending NONE durations are int32 and the key uint32 data");
     }
 
     return ffi::Error::Success();
@@ -1129,7 +1297,7 @@ ffi::Error Act(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets 
     if (args.size() != kReadOperands + kCarryLeaves || results.size() != kCarryLeaves + 1) {
         return ffi::Error::InvalidArgument(
             "nanorts_obi_act takes the State leaves, the unit table, the player, the Pending NONE "
-            "durations, the Legality grid, the key, the attack offsets and the jobs, and returns "
+            "durations, the Legality words, the key, the attack offsets and the jobs, and returns "
             "the jobs and the Commands");
     }
 
@@ -1168,7 +1336,7 @@ ffi::Error Act(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets 
 
     const int64_t shared = shared_bytes(size.cells, size.capacity, window.candidates, size.types);
 
-    if (size.cells <= 0 || size.cells >= kFar || size.capacity <= 0 || size.neutral < 0 || size.types <= 0 || shared > nanorts::whole_act::kSharedLimit || nanorts::whole_act::threads_for(size.capacity) > nanorts::whole_act::kMaxThreads) {
+    if (size.cells <= 0 || size.cells >= kLargestFact || size.capacity <= 0 || size.neutral < 0 || size.types <= 0 || shared > nanorts::whole_act::kSharedOptInLimit || nanorts::whole_act::threads_for(size.capacity) > nanorts::whole_act::kMaxThreads) {
         return ffi::Error::InvalidArgument("a lane whose act fits one block's threads and shared memory");
     }
 

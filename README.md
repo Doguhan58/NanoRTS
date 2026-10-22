@@ -157,7 +157,7 @@ env = nanorts.make(
     utt=None,                     # keep the scenario's unit type table, or a UnitTypeTableVersion
     surface="symbolic",           # or "pixels"
     partial_observability=False,  # fog of war
-    final_observation=True,       # False drops infos["final_observation"]
+    final_observation=True,       # False drops infos["final_observation"] and the work of computing it
     feature_dtype=None,           # uint8 by default; jnp.int16 or jnp.int32
     reward_components=False,      # add MicroRTS-Py's shaped reward components
 )
@@ -249,7 +249,7 @@ masks = mix.get_avail_actions(states)                  # bool[mix.rows, C, 78]
 cells = mix.get_slot_cells(states)                     # int32[mix.rows, C]
 rows, states, rewards, dones, infos = mix.step(key, states, row_actions)
 ```
-`mix.slices()` gives each group's rows. Every group must share the scenario and the options.
+`mix.slices()` gives each group's rows. Every group must share the scenario and the options. On the CUDA Kernel path, all groups' Core steps run as one kernel launch.
 
 # Custom Maps and Rendering
 Any MicroRTS map XML loads with the same keywords as the shipped scenarios:

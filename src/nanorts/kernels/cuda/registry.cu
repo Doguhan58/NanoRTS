@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -153,6 +154,23 @@ std::string check_devices(const int32_t* devices, int64_t count) {
     return failure;
 }
 
+int64_t shared_opt_in(const int32_t* devices, int64_t count) {
+    int64_t least = 0;
+
+    for (int64_t index = 0; index < count; ++index) {
+        int bytes = 0;
+
+        if (cudaDeviceGetAttribute(&bytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, devices[index]) != cudaSuccess) {
+            cudaGetLastError();
+            return 0;
+        }
+
+        least = index == 0 ? bytes : std::min<int64_t>(least, bytes);
+    }
+
+    return least;
+}
+
 std::string self_check(const int32_t* devices, int64_t count) {
     std::string failure = unlisted_target();
 
@@ -199,6 +217,10 @@ extern "C" const char* nanorts_targets() {
         return names;
     }();
     return joined.c_str();
+}
+
+extern "C" int64_t nanorts_shared_opt_in(const int32_t* devices, int64_t count) {
+    return nanorts::shared_opt_in(devices, count);
 }
 
 extern "C" const char* nanorts_self_check(const int32_t* devices, int64_t count) {

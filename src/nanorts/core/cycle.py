@@ -31,6 +31,8 @@ from nanorts.model import (
 
 _KERNEL_TARGET = "nanorts_step"
 
+_GROUPS_TARGET = "nanorts_step_groups"
+
 _STRATEGY_CODES = {
     ConflictStrategy.CANCEL_BOTH: 0,
     ConflictStrategy.CANCEL_RANDOM: 1,
@@ -92,13 +94,14 @@ _COLUMN_OF_EVENT_FIELD: Final[dict[str, str]] = {
     "spawn_balance": "balance",
 }
 
-_SHARED_BYTES_PER_OWNED_SLOT = 32
+_PACKED_RETAINED_ACTOR_BYTES: Final[dict[int, int]] = {2: 20, 4: 24}
 
 _SHARED_BYTES_PER_BLOCK = 48 * 1024
 
+_ALIASED_LEAVES: Final[tuple[str, ...]] = (*_PER_SLOT_LEAVES, "entity_at")
+
 _WRITTEN_LEAVES: Final[tuple[str, ...]] = (
-    *_PER_SLOT_LEAVES,
-    "entity_at",
+    *_ALIASED_LEAVES,
     "time",
     "player_resources",
     "next_birth",
@@ -111,25 +114,78 @@ _WRITTEN_LEAVES: Final[tuple[str, ...]] = (
 
 def fits(bucket: BucketSpec) -> bool:
     owned_slots = PLAYER_COUNT * bucket.per_player_capacity
-    return owned_slots * _SHARED_BYTES_PER_OWNED_SLOT <= _SHARED_BYTES_PER_BLOCK
+    slot_bytes = SLOT_INDEX.resolve(bucket).itemsize
+    cell_bytes = CELL_INDEX.resolve(bucket).itemsize
+    per_owned_slot = 2 * slot_bytes + _PACKED_RETAINED_ACTOR_BYTES[cell_bytes]
+    return owned_slots * per_owned_slot <= _SHARED_BYTES_PER_BLOCK
 
 
 def on_device(key: Array, state: State, commands: Commands, game: GameConfig) -> StepResult:
     bucket = game.bucket
-    leaves = [
-        *(getattr(state, name) for name in _WRITTEN_LEAVES),
-        state.telemetry.spawn_overflow,
-    ]
+    leaves = _written_leaves(state)
     read_operands = _read_operands(key, commands, game)
     outputs = kernels.call(
         _KERNEL_TARGET,
         [*read_operands, *leaves],
         _output_shapes(leaves, bucket),
-        aliases={len(read_operands) + index: index for index in range(len(leaves))},
+        aliases={len(read_operands) + index: index for index in range(len(_ALIASED_LEAVES))},
         attributes={"strategy": _STRATEGY_CODES[bucket.conflict_strategy]},
     )
-    acted = _state_from_outputs(state, outputs[: len(leaves)])
-    events = _events_from_outputs(outputs[len(leaves) :], bucket)
+    return _result(state, outputs, game)
+
+
+def on_device_groups(requests: Sequence[tuple[Array, State, Commands, GameConfig]]) -> list[StepResult]:
+    operands: list[Array] = []
+    results: list[jax.ShapeDtypeStruct] = []
+    aliases: dict[int, int] = {}
+    spans = []
+    for key, state, commands, game in requests:
+        leaves = _written_leaves(state)
+        read_operands = _group_read_operands(key, commands, game)
+        aliases.update(
+            {
+                len(operands) + len(read_operands) + index: len(results) + index
+                for index in range(len(_ALIASED_LEAVES))
+            }
+        )
+        operands.extend([*read_operands, *leaves])
+        lanes = state.time.shape[0]
+        rows = _output_shapes(
+            [jax.ShapeDtypeStruct(leaf.shape[1:], leaf.dtype) for leaf in leaves],
+            game.bucket,
+        )
+        spans.append(slice(len(results), len(results) + len(rows)))
+        results.extend(
+            jax.ShapeDtypeStruct((lanes, *row.shape), row.dtype) for row in rows
+        )
+    outputs = jax.ffi.ffi_call(
+        _GROUPS_TARGET,
+        results,
+        input_output_aliases=aliases,
+        vmap_method="sequential",
+    )(
+        *operands,
+        build_id=kernels.build_id(),
+        strategy=_STRATEGY_CODES[requests[0][3].bucket.conflict_strategy],
+        groups=len(requests),
+    )
+    return [
+        jax.vmap(_result, in_axes=(0, 0, None))(state, outputs[span], game)
+        for (_, state, _, game), span in zip(requests, spans, strict=True)
+    ]
+
+
+def _written_leaves(state: State) -> list[Array]:
+    return [
+        *(getattr(state, name) for name in _WRITTEN_LEAVES),
+        state.telemetry.spawn_overflow,
+    ]
+
+
+def _result(state: State, outputs: Sequence[Array], game: GameConfig) -> StepResult:
+    written = len(_WRITTEN_LEAVES) + 1
+    acted = _state_from_outputs(state, outputs[:written])
+    events = _events_from_outputs(outputs[written:], game.bucket)
     return StepResult(
         next_state=acted,
         terminated=acted.game_over,
@@ -155,6 +211,19 @@ def _read_operands(key: Array, commands: Commands, game: GameConfig) -> list[Arr
         game.terrain,
         jnp.asarray(unit_tables.unit_table(game)),
         jnp.asarray(unit_tables.unit_timings(game)),
+    ]
+
+
+def _group_read_operands(keys: Array, commands: Commands, game: GameConfig) -> list[Array]:
+    random_roots, *command_rows, terrain, table, timings = _read_operands(
+        keys, commands, game
+    )
+    return [
+        random_roots if random_roots.ndim == 2 else random_roots[None],
+        *command_rows,
+        terrain[None],
+        table[None],
+        timings[None],
     ]
 
 

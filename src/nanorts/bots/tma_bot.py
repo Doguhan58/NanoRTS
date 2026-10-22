@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from jax import Array, lax
 
 from nanorts import kernels
-from nanorts.bots import pathfinding
+from nanorts.bots import pathfinding, whole_act
 from nanorts.bots.bot import Bot
 from nanorts.model import (
     ABSENT,
@@ -142,6 +142,12 @@ _SKIPPED: Final[int] = 6
 
 _FIRST_PASS_PHASE: Final[str] = "first_pass"
 _WORKER_PHASE: Final[str] = "workers"
+
+_TARGET: Final[str] = "nanorts_tma_act"
+_ACT_COLUMNS: Final[tuple[str, ...]] = ("unit_attack_damage", "unit_attack_time")
+_BYTES_PER_CELL: Final[int] = 10
+_BYTES_PER_SLOT: Final[int] = 15
+_BYTES_PER_ENTITY: Final[int] = 20
 
 
 class MacroMemory(NamedTuple):
@@ -1561,6 +1567,41 @@ def _init(game: GameConfig) -> MacroMemory:
 
 def _act(key: Array, memory: MacroMemory, state: State, game: GameConfig, player: Array | int) -> tuple[MacroMemory, Commands]:
     del key
+    if not _fits(game.bucket):
+        return _act_by_program(memory, state, game, player)
+    return kernels.dispatch(
+        memory, state, game, player, kernel=_act_by_kernel, program=_act_by_program
+    )
+
+
+def _fits(bucket: BucketSpec) -> bool:
+    return whole_act.fits(
+        bucket,
+        bytes_per_cell=_BYTES_PER_CELL,
+        lane_bytes=0,
+        bytes_per_slot=_BYTES_PER_SLOT,
+        bytes_per_entity=_BYTES_PER_ENTITY,
+    )
+
+
+def _act_by_kernel(memory: MacroMemory, state: State, game: GameConfig, player: Array | int) -> tuple[MacroMemory, Commands]:
+    return whole_act.act(
+        _TARGET,
+        memory,
+        state,
+        game,
+        player,
+        attributes={},
+        operands=[
+            state.hit_points,
+            state.pending_completes_at,
+            state.time,
+            whole_act.unit_table(game, _ACT_COLUMNS),
+        ],
+    )
+
+
+def _act_by_program(memory: MacroMemory, state: State, game: GameConfig, player: Array | int) -> tuple[MacroMemory, Commands]:
     seen = _read(state, game, player)
     memory = _initialize(memory, seen)
 

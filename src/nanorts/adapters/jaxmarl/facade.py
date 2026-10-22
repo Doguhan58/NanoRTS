@@ -16,14 +16,24 @@ from nanorts.adapters.jaxmarl.actions import AvailActions, legal_actions, slot_c
 from nanorts.adapters.jaxmarl.env import (
     JaxMARLStep,
     published_components,
+    request,
     reset,
+    respond,
     step,
     transition,
 )
 from nanorts.adapters.jaxmarl.layout import AGENTS, JaxMARLLayout, prepare
 from nanorts.adapters.jaxmarl.observation import Observations, observe
 from nanorts.adapters.lifecycle import EnvironmentState, spawn_overflowed
-from nanorts.model import PLAYER_COUNT, GameConfig, ModelError, UnitTypeTableVersion
+from nanorts.model import (
+    PLAYER_COUNT,
+    Commands,
+    GameConfig,
+    ModelError,
+    State,
+    StepResult,
+    UnitTypeTableVersion,
+)
 
 ALL_AGENTS: Final[str] = "__all__"
 
@@ -78,6 +88,7 @@ class NanoRTS(MultiAgentEnv):
             feature_dtype=feature_dtype,
             mask_form="rows",
             reward_components=reward_components,
+            final_observation=final_observation,
         )
         self.observation_spaces: dict[str, spaces.Dict] = dict.fromkeys(
             self.agents, _observation_space(self.layout)
@@ -103,13 +114,17 @@ class NanoRTS(MultiAgentEnv):
                 "root, so a caller-supplied reset State would carry an episode "
                 "identity nothing addresses"
             )
-        result = step(state, actions, self.game, layout=self.layout, assets=self.assets)
-        return (
-            result.observations,
-            result.environment_state,
-            self._rewards(result.reward),
-            self._dones(result.done),
-            self._infos(result),
+        return self._outputs(
+            step(state, actions, self.game, layout=self.layout, assets=self.assets)
+        )
+
+    def step_request(self, state: EnvironmentState, actions: dict[str, Array]) -> tuple[tuple[Array, State, Commands], None]:
+        return request(state, actions, self.game, layout=self.layout), None
+
+    def step_response(self, state: EnvironmentState, carry: None, stepped: StepResult) -> tuple[Observations, EnvironmentState, dict[str, Array], dict[str, Array], dict[str, Any],]:
+        del carry
+        return self._outputs(
+            respond(state, stepped, self.game, layout=self.layout, assets=self.assets)
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -171,6 +186,15 @@ class NanoRTS(MultiAgentEnv):
     @property
     def agent_classes(self) -> dict[str, list[str]]:
         return {"player": list(self.agents)}
+
+    def _outputs(self, result: JaxMARLStep) -> tuple[Observations, EnvironmentState, dict[str, Array], dict[str, Array], dict[str, Any],]:
+        return (
+            result.observations,
+            result.environment_state,
+            self._rewards(result.reward),
+            self._dones(result.done),
+            self._infos(result),
+        )
 
     def _rewards(self, reward: Array) -> dict[str, Array]:
         return {

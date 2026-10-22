@@ -24,6 +24,8 @@ _LANE_BYTES: Final[int] = 96
 
 _BYTES_PER_SLOT: Final[int] = 33
 
+_BYTES_PER_ENTITY: Final[int] = 12
+
 _Act = Callable[
     [AbstractActions, State, GameConfig, Array | int], tuple[AbstractActions, Commands]
 ]
@@ -44,6 +46,7 @@ def _fits(bucket: BucketSpec) -> bool:
         bytes_per_cell=_BYTES_PER_CELL,
         lane_bytes=_LANE_BYTES,
         bytes_per_slot=_BYTES_PER_SLOT,
+        bytes_per_entity=_BYTES_PER_ENTITY,
     )
 
 

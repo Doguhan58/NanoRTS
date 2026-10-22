@@ -395,9 +395,8 @@ def _kernel(units: int) -> _Act:
 
 
 def _operands(key: Array, state: State, game: GameConfig) -> list[Array]:
-    grid = _legality(state, game)
     return [
-        *(getattr(grid, field.name) for field in dataclasses.fields(Legality)),
+        whole_act.legality_words(_legality(state, game)),
         jax.random.key_data(key),
         _log_weight(game),
         jnp.asarray(attack_offsets(game.bucket)),

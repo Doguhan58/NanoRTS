@@ -28,20 +28,13 @@ from nanorts.model import (
 
 def decode_actions(actions: Array, state: State, game: GameConfig, *, layout: GridNetLayout) -> Commands:
     if _kernel_fits(game.bucket):
-        rows = kernels.dispatch(
+        return kernels.dispatch(
             actions, state, game, kernel=_decode_in_kernel, program=_decode
         )
-    else:
-        rows = _decode(actions, state, game)
-    return Commands(
-        **{name: jnp.stack(values).astype(jnp.int32) for name, values in rows.items()}
-    )
+    return _decode(actions, state, game)
 
 
-type _Rows = dict[str, list[Array]]
-
-
-def _decode(actions: Array, state: State, game: GameConfig) -> _Rows:
+def _decode(actions: Array, state: State, game: GameConfig) -> Commands:
     bucket = game.bucket
     base_positions, base_resources = source_filter.pending_usage(state, game)
     legality = core.legal_commands(state, game)
@@ -123,12 +116,14 @@ _COMMAND_FIELDS = (
 )
 
 
-def _commands_of(decoded: list[DecodedRows], state: State, bucket: BucketSpec) -> _Rows:
+def _commands_of(decoded: list[DecodedRows], state: State, bucket: BucketSpec) -> Commands:
     fields: dict[str, list[Array]] = {name: [] for name in _COMMAND_FIELDS}
     for player, rows in enumerate(decoded):
         for name, value in _player_commands(rows, state, bucket, player).items():
             fields[name].append(value)
-    return fields
+    return Commands(
+        **{name: jnp.stack(values).astype(jnp.int32) for name, values in fields.items()}
+    )
 
 
 def _player_commands(rows: DecodedRows, state: State, bucket: BucketSpec, player: int) -> dict[str, Array]:
@@ -195,9 +190,9 @@ def _warp_words(bucket: BucketSpec) -> int:
     )
 
 
-def _decode_in_kernel(actions: Array, state: State, game: GameConfig) -> _Rows:
+def _decode_in_kernel(actions: Array, state: State, game: GameConfig) -> Commands:
     bucket = game.bucket
-    legality = core.legal_commands(state, game)
+    legality = core.legal_commands(state, game, stored="words")
     unit_cost = game.unit_cost.astype(jnp.int32)
     fields = kernels.call(
         _DECODE_TARGET,
@@ -229,7 +224,9 @@ def _decode_in_kernel(actions: Array, state: State, game: GameConfig) -> _Rows:
             "warp_words": _warp_words(bucket),
         },
     )
-    return {
-        field.name: [value[player] for player in range(PLAYER_COUNT)]
-        for field, value in zip(dataclasses.fields(Commands), fields, strict=True)
-    }
+    return Commands(
+        **{
+            field.name: value
+            for field, value in zip(dataclasses.fields(Commands), fields, strict=True)
+        }
+    )

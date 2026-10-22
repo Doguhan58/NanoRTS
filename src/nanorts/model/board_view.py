@@ -21,13 +21,13 @@ class BoardView:
 
     owner: Array = leaf(FIELD, jnp.int8, fill=OWNER_NEUTRAL)
 
-    unit_type: Array = leaf(FIELD, jnp.int32, fill=ABSENT)
+    unit_type: Array = leaf(FIELD, jnp.int8, fill=ABSENT)
 
-    hit_points: Array = leaf(FIELD, jnp.int32, fill=0)
+    hit_points: Array = leaf(FIELD, jnp.int16, fill=0)
 
     carried_resources: Array = leaf(FIELD, jnp.int32, fill=0)
 
-    pending_kind: Array = leaf(FIELD, jnp.int32, fill=KIND_ABSENT)
+    pending_kind: Array = leaf(FIELD, jnp.int8, fill=KIND_ABSENT)
 
     available: Array = leaf(FIELD, jnp.bool_, fill=False)
 

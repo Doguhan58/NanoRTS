@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
+import operator
 from typing import Final
 
 import jax
@@ -9,6 +11,7 @@ from jax import Array
 from jax.typing import DTypeLike
 
 from nanorts.model import (
+    ABSENT,
     ACTION_KIND_COUNT,
     KIND_NONE,
     PLAYER_COUNT,
@@ -18,7 +21,7 @@ from nanorts.model import (
     board_view,
     leaf,
 )
-from nanorts.observations.visibility import observer_index, project
+from nanorts.observations.visibility import observer_index, visibility, visible_board
 
 GROUPS: Final[tuple[str, ...]] = (
     "hit_points",
@@ -47,6 +50,19 @@ FEATURE_MAP_DTYPES: Final[tuple[jnp.dtype, ...]] = (
     jnp.dtype(jnp.int16),
     jnp.dtype(jnp.uint8),
 )
+
+_OCCUPANT_WORD: Final[tuple[tuple[str, int, int], ...]] = (
+    ("hit_points", 0, 8),
+    ("carried_resources", 8, 8),
+    ("unit_type", 16, 8),
+    ("pending_action_kind", 24, 4),
+    ("owner", 28, 2),
+)
+
+if ACTION_KIND_COUNT > 1 << 4 or PLAYER_COUNT >= 1 << 2:
+    raise ImportError(
+        "the uint8 encode packs every pending kind into 4 bits and every owner into 2"
+    )
 
 
 @jax.tree_util.register_dataclass
@@ -83,9 +99,17 @@ class SymbolicLayout:
 def symbolic(game: GameConfig, state: State, *, observer: int, partial_observability: bool, dtype: DTypeLike = jnp.int32) -> SymbolicObservation:
     player = observer_index(observer)
     published = _feature_map_dtype(dtype)
-    if partial_mode(partial_observability):
-        state = project(game, state, observer=player)
-    board = board_view(state, game)
+    partial = partial_mode(partial_observability)
+    if published == jnp.dtype(jnp.uint8):
+        return SymbolicObservation(
+            feature_maps=_byte_feature_maps(game, state, player, partial),
+            scalars=scalar_vector(state, player),
+        )
+    board = (
+        visible_board(game, state, observer=player)
+        if partial
+        else board_view(state, game)
+    )
     owner = board.owner.astype(jnp.int32)
     groups = {
         "hit_points": board.hit_points,
@@ -101,6 +125,47 @@ def symbolic(game: GameConfig, state: State, *, observer: int, partial_observabi
         ),
         scalars=scalar_vector(state, player),
     )
+
+
+def _byte_feature_maps(game: GameConfig, state: State, player: int, partial: bool) -> Array:
+    word = _occupant_words(game, state)
+    facts = {
+        name: (word >> shift) & ((1 << width) - 1)
+        for name, shift, width in _OCCUPANT_WORD
+    }
+    if partial:
+        seen = visibility(game, state, observer=player).visible_cells
+        shown = (facts["owner"] == player + 1) | seen
+        facts = {name: jnp.where(shown, fact, 0) for name, fact in facts.items()}
+    owner = facts["owner"].astype(jnp.int32)
+    groups = {
+        **facts,
+        "owner": jnp.where(owner > 0, ((owner - 1 + player) % PLAYER_COUNT) + 1, 0),
+        "terrain": game.terrain,
+    }
+    return jnp.stack([groups[name].astype(jnp.uint8) for name in GROUPS], axis=-1)
+
+
+def _occupant_words(game: GameConfig, state: State) -> Array:
+    facts = {
+        "hit_points": state.hit_points,
+        "carried_resources": state.carried_resources,
+        "unit_type": state.unit_type.astype(jnp.int32) + 1,
+        "pending_action_kind": jnp.maximum(
+            state.pending_kind.astype(jnp.int32), KIND_NONE
+        ),
+        "owner": state.owner.astype(jnp.int32) + 1,
+    }
+    word = functools.reduce(
+        operator.or_,
+        [
+            (facts[name].astype(jnp.uint32) & ((1 << width) - 1)) << shift
+            for name, shift, width in _OCCUPANT_WORD
+        ],
+    )
+    occupant = state.entity_at
+    slot = jnp.clip(occupant, 0, game.bucket.entity_capacity - 1)
+    return jnp.where(occupant != ABSENT, word[slot], 0)
 
 
 def scalar_vector(state: State, player: int) -> Array:

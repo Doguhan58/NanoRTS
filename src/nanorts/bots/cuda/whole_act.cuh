@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -16,6 +18,8 @@ constexpr int kWarp = 32;
 constexpr int kMinThreads = 64;
 constexpr int kMaxThreads = 256;
 constexpr int64_t kSharedLimit = 49152;
+constexpr int64_t kSharedOptInLimit = 232448;
+constexpr int kMaxDevices = 64;
 
 template <typename T>
 struct Lanes {
@@ -105,6 +109,56 @@ class Operands {
     ffi::RemainingArgs args_;
     int64_t lanes_;
     int64_t taken_ = 0;
+};
+
+class SharedOptIn {
+  public:
+    ffi::Error allow(const Operands& operands, const void* kernel, int64_t shared) {
+        if (shared <= kSharedLimit) {
+            return ffi::Error::Success();
+        }
+
+        int device = 0;
+        const cudaError_t error = cudaGetDevice(&device);
+
+        if (error != cudaSuccess) {
+            return ffi::Error::Internal(cudaGetErrorString(error));
+        }
+
+        if (device < 0 || device >= kMaxDevices) {
+            return operands.refused("device " + std::to_string(device) + " is past the first " + std::to_string(kMaxDevices));
+        }
+
+        std::call_once(once_[device], [&] { granted_[device] = grant(kernel, device); });
+
+        if (shared > granted_[device]) {
+            return operands.refused("a lane needs " + std::to_string(shared) + " B of shared memory, and device " + std::to_string(device) + " grants a block " + std::to_string(granted_[device]) + " B");
+        }
+
+        return ffi::Error::Success();
+    }
+
+  private:
+    static int64_t grant(const void* kernel, int device) {
+        int opt_in = 0;
+
+        if (cudaDeviceGetAttribute(&opt_in, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess) {
+            cudaGetLastError();
+            return kSharedLimit;
+        }
+
+        const int64_t limit = std::min<int64_t>(opt_in, kSharedOptInLimit);
+
+        if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(limit)) != cudaSuccess) {
+            cudaGetLastError();
+            return kSharedLimit;
+        }
+
+        return limit;
+    }
+
+    std::once_flag once_[kMaxDevices];
+    int64_t granted_[kMaxDevices] = {};
 };
 
 inline ffi::Error read_state(const Operands& operands, Extents& size, ffi::DataType& slot, ffi::DataType& cell) {

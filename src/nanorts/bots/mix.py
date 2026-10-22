@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
+from nanorts import core
 from nanorts.model import ModelError
 
 
@@ -58,14 +59,8 @@ class GroupMix:
     @functools.partial(jax.jit, static_argnums=(0,))
     def step(self, key: Array, states: tuple[Any, ...], actions: Array) -> tuple[Any, tuple[Any, ...], Array, Array, dict[str, Any]]:
         observations, next_states, rewards, dones, infos = zip(
-            *(
-                _step_group(group, key, state, rows)
-                for group, state, rows in zip(
-                    self.groups,
-                    states,
-                    _split(actions, self._row_counts()),
-                    strict=True,
-                )
+            *_stepped_groups(
+                self.groups, key, states, _split(actions, self._row_counts())
             ),
             strict=True,
         )
@@ -107,12 +102,87 @@ def _reset_group(group: Group, roots: Array) -> tuple[Any, Any]:
     return _agent_major(observation, group), state
 
 
+def _stepped_groups(groups: tuple[Group, ...], key: Array, states: tuple[Any, ...], rows: list[Array]) -> list[tuple[Any, Any, Array, Array, dict[str, Any]]]:
+    stepped: dict[int, tuple[Any, Any, Array, Array, dict[str, Any]]] = {}
+    for members in _shared_launches(groups):
+        stepped.update(
+            zip(
+                members,
+                _step_in_one_launch(
+                    [groups[index] for index in members],
+                    [states[index] for index in members],
+                    [rows[index] for index in members],
+                ),
+                strict=True,
+            )
+        )
+    return [
+        stepped[index]
+        if index in stepped
+        else _step_group(group, key, state, group_rows)
+        for index, (group, state, group_rows) in enumerate(
+            zip(groups, states, rows, strict=True)
+        )
+    ]
+
+
+def _shared_launches(groups: tuple[Group, ...]) -> list[list[int]]:
+    by_bucket: dict[Any, list[int]] = {}
+    for index, group in enumerate(groups):
+        if _splits_step(group):
+            by_bucket.setdefault(group.environment.game.bucket, []).append(index)
+    return [
+        members
+        for members in by_bucket.values()
+        if core.steps_together([groups[index].environment.game for index in members])
+    ]
+
+
+def _splits_step(group: Group) -> bool:
+    environment = group.environment
+    return callable(getattr(environment, "step_request", None)) and callable(
+        getattr(environment, "step_response", None)
+    )
+
+
+def _step_in_one_launch(groups: list[Group], states: list[Any], rows: list[Array]) -> list[tuple[Any, Any, Array, Array, dict[str, Any]]]:
+    requests = [
+        jax.vmap(group.environment.step_request)(state, _actions(group, group_rows))
+        for group, state, group_rows in zip(groups, states, rows, strict=True)
+    ]
+    results = core.step_groups(
+        [
+            (*request, group.environment.game)
+            for group, (request, _) in zip(groups, requests, strict=True)
+        ]
+    )
+    return [
+        _agent_rows(
+            group, jax.vmap(group.environment.step_response)(state, carry, result)
+        )
+        for group, state, (_, carry), result in zip(
+            groups, states, requests, results, strict=True
+        )
+    ]
+
+
 def _step_group(group: Group, key: Array, state: Any, rows: Array) -> tuple[Any, Any, Array, Array, dict[str, Any]]:
+    return _agent_rows(
+        group,
+        jax.vmap(group.environment.step, in_axes=(None, 0, 0))(
+            key, state, _actions(group, rows)
+        ),
+    )
+
+
+def _actions(group: Group, rows: Array) -> dict[str, Array]:
     agents = group.environment.agents
-    actions = dict(zip(agents, jnp.split(rows, len(agents)), strict=True))
-    observation, following, rewards, dones, infos = jax.vmap(
-        group.environment.step, in_axes=(None, 0, 0)
-    )(key, state, actions)
+    return dict(zip(agents, jnp.split(rows, len(agents)), strict=True))
+
+
+def _agent_rows(group: Group, stepped: tuple[Any, Any, Any, Any, dict[str, Any]]) -> tuple[Any, Any, Array, Array, dict[str, Any]]:
+    agents = group.environment.agents
+    observation, following, rewards, dones, infos = stepped
     return (
         _agent_major(observation, group),
         following,

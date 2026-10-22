@@ -96,8 +96,8 @@ _KINDS: Final[frozenset[int]] = frozenset(
 _TARGET: Final[str] = "nanorts_coac_act"
 _BYTES_PER_CELL: Final[int] = 8
 _LANE_BYTES: Final[int] = 1024
-_BYTES_PER_SLOT: Final[int] = 84
-_BYTES_PER_ENTITY: Final[int] = 14
+_BYTES_PER_SLOT: Final[int] = 86
+_BYTES_PER_ENTITY: Final[int] = 20
 _TURN_COLUMNS: Final[tuple[str, ...]] = (
     "unit_attack_damage",
     "unit_attack_time",

@@ -64,6 +64,17 @@ def devices_within(capabilities: frozenset[str]) -> bool:
 
 
 @functools.cache
+def shared_opt_in_bytes() -> int:
+    if library.LIBRARY is None:
+        return 0
+    try:
+        devices = jax.local_devices(backend="cuda")
+    except RuntimeError:
+        return 0
+    return library.shared_opt_in([device.local_hardware_id for device in devices])
+
+
+@functools.cache
 def _capabilities() -> frozenset[str]:
     try:
         devices = jax.devices("cuda")

@@ -1,4 +1,6 @@
 #include <cstdint>
+#include <string>
+#include <string_view>
 
 #include "nanorts_ffi.cuh"
 
@@ -8,6 +10,7 @@ namespace ffi = xla::ffi;
 
 constexpr int64_t kMaxLeaves = 32;
 constexpr int kWarpsPerBlock = 8;
+constexpr int64_t kPackedRowAlignment = 16;
 
 struct Leaf {
     const char* reset;
@@ -76,28 +79,30 @@ __global__ void reset_where_done(const uint8_t* done, int64_t done_stride, Leave
     }
 }
 
-ffi::Error ResetWhereDone(cudaStream_t stream, ffi::Buffer<ffi::PRED> done, ffi::RemainingArgs operands, ffi::RemainingRets results, std::string_view build_id, int64_t count) {
-    if (ffi::Error error = nanorts::check_build_id(build_id); error.failure()) {
-        return error;
+struct ResetRow {
+    const char* data;
+    int64_t stride;
+};
+
+struct BoundLeaves {
+    Leaves leaves;
+    int64_t lanes;
+};
+
+template <typename ResetRowOf>
+ffi::ErrorOr<BoundLeaves> bind_leaves(std::string_view target, ffi::RemainingArgs operands, ffi::RemainingRets results, int64_t count, int64_t first_next, ResetRowOf reset_row_of) {
+    if (count < 0 || count > kMaxLeaves || results.size() != static_cast<size_t>(count) || operands.size() < static_cast<size_t>(first_next + count)) {
+        return ffi::Error::InvalidArgument(std::string(target) + " takes the reset rows and `leaves` next and result buffers");
     }
 
-    if (count < 0 || count > kMaxLeaves || results.size() != static_cast<size_t>(count) || operands.size() < static_cast<size_t>(2 * count)) {
-        return ffi::Error::InvalidArgument("nanorts_reset_where_done takes `leaves` reset, next and result buffers");
-    }
-
-    Leaves leaves{};
-    leaves.count = count;
-    leaves.in_place = true;
-    int64_t lanes = -1;
+    BoundLeaves bound{};
+    bound.leaves.count = count;
+    bound.leaves.in_place = true;
+    bound.lanes = -1;
 
     for (int64_t k = 0; k < count; ++k) {
-        auto reset = operands.get<ffi::AnyBuffer>(k);
-        auto next = operands.get<ffi::AnyBuffer>(count + k);
+        auto next = operands.get<ffi::AnyBuffer>(first_next + k);
         auto out = results.get<ffi::AnyBuffer>(k);
-
-        if (!reset.has_value()) {
-            return reset.error();
-        }
 
         if (!next.has_value()) {
             return next.error();
@@ -111,10 +116,10 @@ ffi::Error ResetWhereDone(cudaStream_t stream, ffi::Buffer<ffi::PRED> done, ffi:
         const int64_t extent = nanorts::lanes(result);
 
         if (k == 0) {
-            lanes = extent;
+            bound.lanes = extent;
         }
 
-        if (extent != lanes || nanorts::lanes(*next) != lanes) {
+        if (extent != bound.lanes || nanorts::lanes(*next) != bound.lanes) {
             return ffi::Error::InvalidArgument("every leaf has the same lane count");
         }
 
@@ -122,38 +127,102 @@ ffi::Error ResetWhereDone(cudaStream_t stream, ffi::Buffer<ffi::PRED> done, ffi:
             return ffi::Error::InvalidArgument("each result has its next leaf's type");
         }
 
-        leaves.in_place &= next->untyped_data() == result.untyped_data();
+        bound.leaves.in_place &= next->untyped_data() == result.untyped_data();
+        const int64_t row_bytes = bound.lanes == 0 ? 0 : static_cast<int64_t>(result.size_bytes()) / bound.lanes;
+        auto reset = reset_row_of(k, result, row_bytes, bound.lanes);
+
+        if (reset.has_error()) {
+            return reset.error();
+        }
+
+        bound.leaves.leaf[k] = Leaf{reset->data, static_cast<const char*>(next->untyped_data()), static_cast<char*>(result.untyped_data()), row_bytes, reset->stride};
+    }
+
+    return bound;
+}
+
+ffi::Error launch(cudaStream_t stream, ffi::Buffer<ffi::PRED> done, const BoundLeaves& bound) {
+    const int64_t flags = done.dimensions().size() == 0 ? 0 : done.dimensions()[0];
+
+    if (bound.leaves.count > 0 && flags != 1 && flags != bound.lanes) {
+        return ffi::Error::InvalidArgument("one done flag for every lane or one shared");
+    }
+
+    if (bound.leaves.count == 0 || bound.lanes == 0) {
+        return ffi::Error::Success();
+    }
+
+    const int64_t blocks = (bound.lanes + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    reset_where_done<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stream>>>(reinterpret_cast<const uint8_t*>(done.typed_data()), flags == 1 ? 0 : 1, bound.leaves, bound.lanes);
+    return nanorts::launched();
+}
+
+ffi::Error ResetWhereDone(cudaStream_t stream, ffi::Buffer<ffi::PRED> done, ffi::RemainingArgs operands, ffi::RemainingRets results, std::string_view build_id, int64_t count) {
+    if (ffi::Error error = nanorts::check_build_id(build_id); error.failure()) {
+        return error;
+    }
+
+    auto bound = bind_leaves("nanorts_reset_where_done", operands, results, count, count, [&](int64_t k, const ffi::AnyBuffer& result, int64_t row_bytes, int64_t lanes) -> ffi::ErrorOr<ResetRow> {
+        auto reset = operands.get<ffi::AnyBuffer>(k);
+
+        if (!reset.has_value()) {
+            return reset.error();
+        }
 
         if (reset->element_type() != result.element_type()) {
             return ffi::Error::InvalidArgument("a reset leaf has its result's dtype");
         }
 
-        const int64_t row_bytes = lanes == 0 ? 0 : static_cast<int64_t>(result.size_bytes()) / lanes;
         const int64_t shared = nanorts::lanes(*reset);
 
         if ((shared != 1 && shared != lanes) || static_cast<int64_t>(reset->size_bytes()) != shared * row_bytes) {
             return ffi::Error::InvalidArgument("a reset leaf holds one row for every lane or one shared row");
         }
 
-        leaves.leaf[k] = Leaf{static_cast<const char*>(reset->untyped_data()), static_cast<const char*>(next->untyped_data()), static_cast<char*>(result.untyped_data()), row_bytes, shared == 1 ? 0 : row_bytes};
+        return ResetRow{static_cast<const char*>(reset->untyped_data()), shared == 1 ? 0 : row_bytes};
+    });
+
+    if (bound.has_error()) {
+        return bound.error();
     }
 
-    const int64_t flags = done.dimensions().size() == 0 ? 0 : done.dimensions()[0];
+    return launch(stream, done, *bound);
+}
 
-    if (count > 0 && flags != 1 && flags != lanes) {
-        return ffi::Error::InvalidArgument("one done flag for every lane or one shared");
+int64_t packed_row_bytes(int64_t row_bytes) {
+    return (row_bytes + kPackedRowAlignment - 1) / kPackedRowAlignment * kPackedRowAlignment;
+}
+
+ffi::Error ResetPackedWhereDone(cudaStream_t stream, ffi::Buffer<ffi::PRED> done, ffi::AnyBuffer packed, ffi::RemainingArgs operands, ffi::RemainingRets results, std::string_view build_id, int64_t count) {
+    if (ffi::Error error = nanorts::check_build_id(build_id); error.failure()) {
+        return error;
     }
 
-    if (count == 0 || lanes == 0) {
-        return ffi::Error::Success();
+    if (packed.element_type() != ffi::DataType::U8 || packed.dimensions().size() != 2 || nanorts::lanes(packed) != 1) {
+        return ffi::Error::InvalidArgument("nanorts_reset_packed_where_done takes the reset rows as one shared uint8 row");
     }
 
-    const int64_t blocks = (lanes + kWarpsPerBlock - 1) / kWarpsPerBlock;
-    reset_where_done<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stream>>>(reinterpret_cast<const uint8_t*>(done.typed_data()), flags == 1 ? 0 : 1, leaves, lanes);
-    return nanorts::launched();
+    const char* rows = static_cast<const char*>(packed.untyped_data());
+    int64_t offset = 0;
+    auto bound = bind_leaves("nanorts_reset_packed_where_done", operands, results, count, 0, [&](int64_t, const ffi::AnyBuffer&, int64_t row_bytes, int64_t) -> ffi::ErrorOr<ResetRow> {
+        const ResetRow row{rows + offset, 0};
+        offset += packed_row_bytes(row_bytes);
+        return row;
+    });
+
+    if (bound.has_error()) {
+        return bound.error();
+    }
+
+    if (bound->lanes > 0 && offset != static_cast<int64_t>(packed.size_bytes())) {
+        return ffi::Error::InvalidArgument("nanorts_reset_packed_where_done: the packed row holds each leaf's row at the next 16-byte offset");
+    }
+
+    return launch(stream, done, *bound);
 }
 
 const nanorts::Kernels nanorts_reset_where_done_kernels("nanorts_reset_where_done", {nanorts::kernel(reset_where_done)});
+const nanorts::Kernels nanorts_reset_packed_where_done_kernels("nanorts_reset_packed_where_done", {nanorts::kernel(reset_where_done)});
 
 }
 
@@ -161,6 +230,16 @@ NANORTS_HANDLER(nanorts_reset_where_done, ResetWhereDone,
                 ffi::Ffi::Bind()
                     .Ctx<ffi::PlatformStream<cudaStream_t>>()
                     .Arg<ffi::Buffer<ffi::PRED>>()
+                    .RemainingArgs()
+                    .RemainingRets()
+                    .Attr<std::string_view>("build_id")
+                    .Attr<int64_t>("leaves"));
+
+NANORTS_HANDLER(nanorts_reset_packed_where_done, ResetPackedWhereDone,
+                ffi::Ffi::Bind()
+                    .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                    .Arg<ffi::Buffer<ffi::PRED>>()
+                    .Arg<ffi::AnyBuffer>()
                     .RemainingArgs()
                     .RemainingRets()
                     .Attr<std::string_view>("build_id")

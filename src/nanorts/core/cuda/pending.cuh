@@ -9,7 +9,7 @@
 namespace nanorts::core {
 
 template <typename Slot, typename Cell>
-__device__ int32_t order_holders(const LaneState<Slot, Cell>& state, const Extents& size, int32_t* held, uint64_t* listed) {
+__device__ int32_t order_holders(const LaneState<Slot, Cell>& state, const Extents& size, Slot* held, uint64_t* listed) {
     const int lane = threadIdx.x % 32;
     int32_t holders = 0;
 
@@ -36,7 +36,7 @@ __device__ int32_t order_holders(const LaneState<Slot, Cell>& state, const Exten
             place += listed[other] < entry;
         }
 
-        held[place] = size.neutral + ranked_local(entry);
+        held[place] = static_cast<Slot>(size.neutral + ranked_local(entry));
     }
 
     __syncwarp();
@@ -44,7 +44,7 @@ __device__ int32_t order_holders(const LaneState<Slot, Cell>& state, const Exten
 }
 
 template <typename Slot, typename Cell>
-__device__ int32_t batch_order(const LaneState<Slot, Cell>& state, const int32_t* held, int32_t holders, int32_t* members) {
+__device__ int32_t batch_order(const LaneState<Slot, Cell>& state, const Slot* held, int32_t holders, Slot* members) {
     const int lane = threadIdx.x % 32;
     const int32_t time = *state.time;
     int32_t count = 0;
@@ -63,7 +63,7 @@ __device__ int32_t batch_order(const LaneState<Slot, Cell>& state, const int32_t
         const unsigned acting_lanes = __ballot_sync(kWarp, acting);
 
         if (acting) {
-            members[count + __popc(acting_lanes & ((1u << lane) - 1u))] = slot;
+            members[count + __popc(acting_lanes & ((1u << lane) - 1u))] = static_cast<Slot>(slot);
         }
 
         count += __popc(acting_lanes);

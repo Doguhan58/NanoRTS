@@ -8,7 +8,8 @@ import jax
 import jax.numpy as jnp
 from jax import Array, lax
 
-from nanorts.bots import pathfinding
+from nanorts import kernels
+from nanorts.bots import pathfinding, whole_act
 from nanorts.bots.bot import Bot
 from nanorts.model import (
     ABSENT,
@@ -72,6 +73,20 @@ _CROWDING_DIVISOR: Final[float] = 2.9
 _SITE_RADIUS: Final[int] = 2
 _LATE: Final[int] = 1000
 _LEVEL_WEIGHT: Final[int] = 1000
+_TARGET: Final[str] = "nanorts_mayari_act"
+_TURN_COLUMNS: Final[tuple[str, ...]] = (
+    "unit_attack_damage",
+    "unit_attack_time",
+    "unit_hit_points",
+    "unit_produce_time",
+    "unit_move_time",
+)
+_BYTES_PER_CELL: Final[int] = 8
+_LANE_BYTES: Final[int] = 1024
+_BYTES_PER_SLOT: Final[int] = 74
+_BYTES_PER_ENTITY: Final[int] = 37
+_KERNEL_ROWS: Final[int] = 32
+_KERNEL_COLUMNS: Final[int] = 32
 
 
 class Harvesters(NamedTuple):
@@ -1593,6 +1608,62 @@ def _init(game: GameConfig) -> Harvesters:
 
 
 def _act(key: Array, carry: Harvesters, state: State, game: GameConfig, player: Array | int) -> tuple[Harvesters, Commands]:
+    if not _fits(game.bucket):
+        return _act_by_program(key, carry, state, game, player)
+    return kernels.dispatch(
+        key, carry, state, game, player, kernel=_act_by_kernel, program=_act_by_program
+    )
+
+
+def _fits(bucket: BucketSpec) -> bool:
+    return (
+        bucket.height <= _KERNEL_ROWS
+        and bucket.width <= _KERNEL_COLUMNS
+        and whole_act.fits(
+            bucket,
+            bytes_per_cell=_BYTES_PER_CELL,
+            lane_bytes=_LANE_BYTES,
+            bytes_per_slot=_BYTES_PER_SLOT,
+            bytes_per_entity=_BYTES_PER_ENTITY,
+        )
+    )
+
+
+def _draw_ranks(key: Array, bucket: BucketSpec) -> Array:
+    every = jnp.arange(DIRECTION_COUNT, dtype=jnp.int32)
+
+    def rank(draw: Array) -> Array:
+        noise = jax.random.gumbel(jax.random.fold_in(key, draw), (DIRECTION_COUNT,))
+        ahead = (noise[None, :] > noise[:, None]) | (
+            (noise[None, :] == noise[:, None]) & (every[None, :] < every[:, None])
+        )
+        place = jnp.sum(ahead, axis=1, dtype=jnp.int32)
+        return jnp.sum(place << (2 * every), dtype=jnp.int32).astype(jnp.uint8)
+
+    draws = jnp.arange(2 * bucket.per_player_capacity, dtype=jnp.int32)
+    return jax.vmap(rank)(draws)
+
+
+def _act_by_kernel(key: Array, carry: Harvesters, state: State, game: GameConfig, player: Array | int) -> tuple[Harvesters, Commands]:
+    return whole_act.act(
+        _TARGET,
+        carry,
+        state,
+        game,
+        player,
+        attributes={},
+        operands=[
+            state.hit_points,
+            state.pending_target_cell,
+            state.pending_completes_at,
+            state.time,
+            whole_act.unit_table(game, _TURN_COLUMNS),
+            _draw_ranks(key, game.bucket),
+        ],
+    )
+
+
+def _act_by_program(key: Array, carry: Harvesters, state: State, game: GameConfig, player: Array | int) -> tuple[Harvesters, Commands]:
     turn = _turn(key, carry, state, game, player)
     return turn.harvesters, _commands(turn, player, game)
 

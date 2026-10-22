@@ -15,6 +15,7 @@ from nanorts.model import (
     FIELD,
     PER_SLOT,
     PLAYER_COUNT,
+    BoardView,
     BucketSpec,
     GameConfig,
     LeafField,
@@ -120,6 +121,16 @@ def project(game: GameConfig, state: State, *, observer: int) -> State:
         state,
         entity_at=jnp.where(survived, state.entity_at, ABSENT),
         **cleared,
+    )
+
+
+def visible_board(game: GameConfig, state: State, *, observer: int) -> BoardView:
+    board = board_view(state, game)
+    seen = visibility(game, state, observer=observer).visible_cells
+    shown = board.present & ((board.owner == observer) | seen)
+    concealed = empty(BoardView, game.bucket)
+    return jax.tree.map(
+        lambda fact, fill: jnp.where(shown, fact, fill), board, concealed
     )
 
 

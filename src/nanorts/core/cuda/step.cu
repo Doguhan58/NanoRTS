@@ -19,11 +19,14 @@ constexpr int kWarpsPerBlock = 4;
 
 constexpr int64_t kSharedBytes = 48 * 1024;
 
+constexpr int64_t kCacheLineBytes = 128;
+
+template <typename Cell>
 struct PackedRetainedActor {
     int32_t birth;
     int32_t carried;
-    int32_t cell;
-    int32_t target_cell;
+    Cell cell;
+    Cell target_cell;
     int8_t kind;
     int8_t direction;
     int8_t produced_type;
@@ -35,8 +38,9 @@ struct PackedRetainedActor {
     }
 };
 
+template <typename Slot, typename Cell>
 __host__ __device__ inline int64_t warp_bytes(int64_t owned) {
-    return owned * static_cast<int64_t>(2 * sizeof(int32_t) + sizeof(PackedRetainedActor));
+    return owned * static_cast<int64_t>(2 * sizeof(Slot) + sizeof(PackedRetainedActor<Cell>));
 }
 
 struct Lanes {
@@ -108,31 +112,115 @@ struct StepLanes {
     Lanes result[kResults];
 };
 
-template <typename Slot, typename Cell>
-__device__ LaneState<Slot, Cell> state_of(const Lanes* leaf, int64_t environment) {
+__host__ __device__ inline const Lanes& row_of(const StepLanes& lanes, int row) {
+    return row < kInOperands ? lanes.operand[row] : lanes.result[row - kInOperands];
+}
+
+__device__ inline void prefetch_bytes(const char* row, int64_t bytes) {
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(row);
+    const uintptr_t line = (begin & ~static_cast<uintptr_t>(kCacheLineBytes - 1)) + (threadIdx.x % 32) * kCacheLineBytes;
+
+    if (line < begin + bytes) {
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(line < begin ? begin : line));
+    }
+}
+
+struct LaneRows {
+    const StepLanes& lanes;
+    int64_t environment;
+
+    template <typename T>
+    __device__ T* operand(int index) const {
+        return lanes.operand[index].at<T>(environment);
+    }
+
+    template <typename T>
+    __device__ T* result(int index) const {
+        return lanes.result[index].at<T>(environment);
+    }
+
+    __device__ void prefetch(int row) const {
+        const Lanes& place = row_of(lanes, row);
+        prefetch_bytes(place.at<const char>(environment), place.stride);
+    }
+};
+
+constexpr int kRows = kInOperands + kResults;
+
+constexpr int kGroupsPerLaunch = 16;
+
+struct GroupLanes {
+    char* data[kGroupsPerLaunch][kRows];
+    int64_t stride[kRows];
+    uint32_t first_block[kGroupsPerLaunch];
+    uint32_t lane_end[kGroupsPerLaunch];
+};
+
+struct GroupRows {
+    char* const* data;
+    const int64_t* stride;
+    int64_t environment;
+
+    template <typename T>
+    __device__ T* operand(int index) const {
+        return reinterpret_cast<T*>(data[index] + environment * stride[index]);
+    }
+
+    template <typename T>
+    __device__ T* result(int index) const {
+        return reinterpret_cast<T*>(data[kInOperands + index] + environment * stride[kInOperands + index]);
+    }
+
+    __device__ void prefetch(int row) const {
+        prefetch_bytes(data[row] + environment * stride[row], stride[row]);
+    }
+};
+
+template <typename Slot, typename Cell, typename Rows>
+__device__ LaneState<Slot, Cell> state_of(const Rows& rows) {
     LaneState<Slot, Cell> state{};
-    state.birth = leaf[kBirth].at<int32_t>(environment);
-    state.unit_type = leaf[kUnitType].at<int8_t>(environment);
-    state.owner = leaf[kOwner].at<int8_t>(environment);
-    state.cell = leaf[kCell].at<Cell>(environment);
-    state.hit_points = leaf[kHitPoints].at<int16_t>(environment);
-    state.carried_resources = leaf[kCarriedResources].at<int32_t>(environment);
-    state.pending_kind = leaf[kPendingKind].at<int8_t>(environment);
-    state.pending_direction = leaf[kPendingDirection].at<int8_t>(environment);
-    state.pending_none_duration = leaf[kPendingNoneDuration].at<int32_t>(environment);
-    state.pending_target_cell = leaf[kPendingTargetCell].at<Cell>(environment);
-    state.pending_produced_type = leaf[kPendingProducedType].at<int8_t>(environment);
-    state.pending_issued_at = leaf[kPendingIssuedAt].at<int32_t>(environment);
-    state.pending_completes_at = leaf[kPendingCompletesAt].at<int32_t>(environment);
-    state.pending_order = leaf[kPendingOrder].at<int32_t>(environment);
-    state.entity_at = leaf[kEntityAt].at<Slot>(environment);
-    state.time = leaf[kTime].at<int32_t>(environment);
-    state.player_resources = leaf[kPlayerResources].at<int32_t>(environment);
-    state.next_birth = leaf[kNextBirth].at<int32_t>(environment);
-    state.next_pending_order = leaf[kNextPendingOrder].at<int32_t>(environment);
-    state.alternating_conflict_count = leaf[kAlternatingConflictCount].at<int32_t>(environment);
-    state.spawn_overflow = leaf[kSpawnOverflow].at<int32_t>(environment);
+    state.birth = rows.template result<int32_t>(kBirth);
+    state.unit_type = rows.template result<int8_t>(kUnitType);
+    state.owner = rows.template result<int8_t>(kOwner);
+    state.cell = rows.template result<Cell>(kCell);
+    state.hit_points = rows.template result<int16_t>(kHitPoints);
+    state.carried_resources = rows.template result<int32_t>(kCarriedResources);
+    state.pending_kind = rows.template result<int8_t>(kPendingKind);
+    state.pending_direction = rows.template result<int8_t>(kPendingDirection);
+    state.pending_none_duration = rows.template result<int32_t>(kPendingNoneDuration);
+    state.pending_target_cell = rows.template result<Cell>(kPendingTargetCell);
+    state.pending_produced_type = rows.template result<int8_t>(kPendingProducedType);
+    state.pending_issued_at = rows.template result<int32_t>(kPendingIssuedAt);
+    state.pending_completes_at = rows.template result<int32_t>(kPendingCompletesAt);
+    state.pending_order = rows.template result<int32_t>(kPendingOrder);
+    state.entity_at = rows.template result<Slot>(kEntityAt);
+    state.time = rows.template result<int32_t>(kTime);
+    state.player_resources = rows.template result<int32_t>(kPlayerResources);
+    state.next_birth = rows.template result<int32_t>(kNextBirth);
+    state.next_pending_order = rows.template result<int32_t>(kNextPendingOrder);
+    state.alternating_conflict_count = rows.template result<int32_t>(kAlternatingConflictCount);
+    state.spawn_overflow = rows.template result<int32_t>(kSpawnOverflow);
     return state;
+}
+
+template <typename Rows>
+__device__ void carry_row(const Rows& rows, int leaf, int elements) {
+    const int32_t* from = rows.template operand<const int32_t>(kInLeaves + leaf);
+    int32_t* to = rows.template result<int32_t>(leaf);
+
+    for (int k = 0; k < elements; ++k) {
+        to[k] = from[k];
+    }
+}
+
+template <typename Rows>
+__device__ void carry_counters(const Rows& rows) {
+    carry_row(rows, kTime, 1);
+    carry_row(rows, kPlayerResources, kPlayers);
+    carry_row(rows, kNextBirth, 1);
+    carry_row(rows, kNextPendingOrder, 1);
+    carry_row(rows, kAlternatingConflictCount, 1);
+    carry_row(rows, kSpawnOverflow, kPlayers);
 }
 
 __device__ void clear_admitted_counters(const Admitted& admitted, int32_t types) {
@@ -164,7 +252,7 @@ __device__ void retire_batch(const LaneState<Slot, Cell>& state, const Extents& 
 }
 
 template <typename Slot, typename Cell>
-__device__ void retain_batch(const LaneState<Slot, Cell>& state, const Extents& size, const int32_t* member_order, int32_t members, uint8_t* is_member, PackedRetainedActor* retained_actors) {
+__device__ void retain_batch(const LaneState<Slot, Cell>& state, const Extents& size, const Slot* member_order, int32_t members, uint8_t* is_member, PackedRetainedActor<Cell>* retained_actors) {
     const int lane = threadIdx.x % 32;
 
     for (int32_t slot = lane; slot < size.entities; slot += 32) {
@@ -176,8 +264,8 @@ __device__ void retain_batch(const LaneState<Slot, Cell>& state, const Extents& 
     for (int32_t position = lane; position < members; position += 32) {
         is_member[member_order[position]] = 1;
         const RetainedActor retained = retained_actor_at(state, member_order[position]);
-        retained_actors[position] = PackedRetainedActor{
-            retained.birth, retained.carried, retained.cell, retained.target_cell, static_cast<int8_t>(retained.kind), static_cast<int8_t>(retained.direction), static_cast<int8_t>(retained.produced_type), static_cast<int8_t>(retained.owner), static_cast<int8_t>(retained.unit_type),
+        retained_actors[position] = PackedRetainedActor<Cell>{
+            retained.birth, retained.carried, static_cast<Cell>(retained.cell), static_cast<Cell>(retained.target_cell), static_cast<int8_t>(retained.kind), static_cast<int8_t>(retained.direction), static_cast<int8_t>(retained.produced_type), static_cast<int8_t>(retained.owner), static_cast<int8_t>(retained.unit_type),
         };
     }
 
@@ -185,7 +273,7 @@ __device__ void retain_batch(const LaneState<Slot, Cell>& state, const Extents& 
 }
 
 template <typename Slot, typename Cell>
-__device__ int32_t admit_requests(const LaneState<Slot, Cell>& state, const Extents& size, const Content& content, const CommandTable& commands, Strategy strategy, nanorts::draws::Key root, const Admitted& admitted, int32_t* request_order, int32_t* held, uint64_t* listed) {
+__device__ int32_t admit_requests(const LaneState<Slot, Cell>& state, const Extents& size, const Content& content, const CommandTable& commands, Strategy strategy, nanorts::draws::Key root, const Admitted& admitted, Slot* request_order, Slot* held, uint64_t* listed) {
     const bool leader = threadIdx.x % 32 == 0;
     const int32_t requests = order_requests(state, size, commands, request_order, listed);
     int32_t holders = order_holders(state, size, held, listed);
@@ -198,7 +286,7 @@ __device__ int32_t admit_requests(const LaneState<Slot, Cell>& state, const Exte
 
         if (appends) {
             if (leader) {
-                held[holders] = slot;
+                held[holders] = static_cast<Slot>(slot);
             }
 
             ++holders;
@@ -210,47 +298,50 @@ __device__ int32_t admit_requests(const LaneState<Slot, Cell>& state, const Exte
     return holders;
 }
 
-template <typename Slot, typename Cell>
-__global__ void __launch_bounds__(kWarpsPerBlock * 32) step(StepLanes lanes, Extents size, Strategy strategy, int64_t environments) {
+template <typename Rows>
+__device__ void prefetch_scanned_rows(const Rows& rows) {
+    rows.prefetch(kInOperands + kBirth);
+    rows.prefetch(kInKind);
+    rows.prefetch(kInOperands + kPendingOrder);
+    rows.prefetch(kInOperands + kPendingKind);
+}
+
+template <typename Slot, typename Cell, typename Rows>
+__device__ __forceinline__ void step_lane(const Rows& rows, const Extents& size, Strategy strategy) {
     using Index = std::conditional_t<sizeof(Slot) == 2 && sizeof(Cell) == 2, int16_t, int32_t>;
     extern __shared__ __align__(8) int32_t working[];
-    const int64_t environment = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
-
-    if (environment >= environments) {
-        return;
-    }
-
     const int lane = threadIdx.x % 32;
     const bool leader = lane == 0;
-    const Lanes* operands = lanes.operand;
-    const Lanes* results = lanes.result;
 
-    LaneState<Slot, Cell> state = state_of<Slot, Cell>(results, environment);
-    state.terrain = operands[kInTerrain].at<const uint8_t>(environment);
-    const Content content{UnitTable{operands[kInTable].at<const int32_t>(environment), size.types}, operands[kInTimings].at<const int32_t>(environment)};
+    LaneState<Slot, Cell> state = state_of<Slot, Cell>(rows);
+    state.terrain = rows.template operand<const uint8_t>(kInTerrain);
+    const Content content{UnitTable{rows.template operand<const int32_t>(kInTable), size.types}, rows.template operand<const int32_t>(kInTimings)};
     const CommandTable commands{
-        operands[kInKind].at<const int32_t>(environment), operands[kInDirection].at<const int32_t>(environment), operands[kInNoneDuration].at<const int32_t>(environment), operands[kInTargetCell].at<const int32_t>(environment), operands[kInProducedType].at<const int32_t>(environment), operands[kInRequestOrder].at<const int32_t>(environment),
+        rows.template operand<const int32_t>(kInKind), rows.template operand<const int32_t>(kInDirection), rows.template operand<const int32_t>(kInNoneDuration), rows.template operand<const int32_t>(kInTargetCell), rows.template operand<const int32_t>(kInProducedType), rows.template operand<const int32_t>(kInRequestOrder),
     };
 
-    const uint32_t* key = operands[kInKey].at<const uint32_t>(environment);
+    prefetch_scanned_rows(rows);
+
+    const uint32_t* key = rows.template operand<const uint32_t>(kInKey);
     const nanorts::draws::Key root{key[0], key[1]};
     const Admitted admitted{
-        results[kAdmittedHarvest].at<int32_t>(environment),
-        results[kAdmittedReturn].at<int32_t>(environment),
-        results[kAdmittedProduce].at<int32_t>(environment),
-        results[kAdmittedAttack].at<int32_t>(environment),
+        rows.template result<int32_t>(kAdmittedHarvest),
+        rows.template result<int32_t>(kAdmittedReturn),
+        rows.template result<int32_t>(kAdmittedProduce),
+        rows.template result<int32_t>(kAdmittedAttack),
     };
 
-    uint8_t* is_member = results[kIsMember].at<uint8_t>(environment);
-    int32_t* int32_records = results[kInt32Records].at<int32_t>(environment);
-    Index* index_records = results[kIndexRecords].at<Index>(environment);
-    int8_t* int8_records = results[kInt8Records].at<int8_t>(environment);
-    char* warp_memory = reinterpret_cast<char*>(working) + (threadIdx.x / 32) * warp_bytes(size.owned);
-    int32_t* order = reinterpret_cast<int32_t*>(warp_memory);
-    int32_t* held = order + size.owned;
-    PackedRetainedActor* retained_actors = reinterpret_cast<PackedRetainedActor*>(held + size.owned);
+    uint8_t* is_member = rows.template result<uint8_t>(kIsMember);
+    int32_t* int32_records = rows.template result<int32_t>(kInt32Records);
+    Index* index_records = rows.template result<Index>(kIndexRecords);
+    int8_t* int8_records = rows.template result<int8_t>(kInt8Records);
+    char* warp_memory = reinterpret_cast<char*>(working) + (threadIdx.x / 32) * warp_bytes<Slot, Cell>(size.owned);
+    Slot* order = reinterpret_cast<Slot*>(warp_memory);
+    Slot* held = order + size.owned;
+    PackedRetainedActor<Cell>* retained_actors = reinterpret_cast<PackedRetainedActor<Cell>*>(held + size.owned);
 
     if (leader) {
+        carry_counters(rows);
         clear_admitted_counters(admitted, size.types);
     }
 
@@ -281,7 +372,36 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) step(StepLanes lanes, Ext
         __syncwarp();
     }
 
-    decide(state, size, results[kGameOver].at<uint8_t>(environment), results[kWinner].at<int32_t>(environment));
+    decide(state, size, rows.template result<uint8_t>(kGameOver), rows.template result<int32_t>(kWinner));
+}
+
+template <typename Slot, typename Cell>
+__global__ void __launch_bounds__(kWarpsPerBlock * 32) step(StepLanes lanes, Extents size, Strategy strategy, int64_t environments) {
+    const uint32_t environment = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+
+    if (environment >= environments) {
+        return;
+    }
+
+    step_lane<Slot, Cell>(LaneRows{lanes, environment}, size, strategy);
+}
+
+template <typename Slot, typename Cell>
+__global__ void __launch_bounds__(kWarpsPerBlock * 32) step_groups(const __grid_constant__ GroupLanes lanes, Extents size, Strategy strategy) {
+    int32_t group = 0;
+
+#pragma unroll
+    for (int32_t later = 1; later < kGroupsPerLaunch; ++later) {
+        group += blockIdx.x >= lanes.first_block[later];
+    }
+
+    const uint32_t environment = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+
+    if (environment >= lanes.lane_end[group]) {
+        return;
+    }
+
+    step_lane<Slot, Cell>(GroupRows{lanes.data[group], lanes.stride, environment}, size, strategy);
 }
 
 ffi::ErrorOr<Lanes> lanes_of(const ffi::AnyBuffer& buffer, int64_t environments, int64_t elements, ffi::DataType type, std::string_view name) {
@@ -304,18 +424,15 @@ ffi::ErrorOr<Lanes> lanes_of(const ffi::AnyBuffer& buffer, int64_t environments,
     return Lanes{static_cast<char*>(buffer.untyped_data()), extent == 1 ? 0 : row_bytes};
 }
 
-ffi::Error Step(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets rets, std::string_view build_id, int64_t strategy) {
-    if (ffi::Error error = nanorts::check_build_id(build_id); error.failure()) {
-        return error;
-    }
+struct BoundLanes {
+    StepLanes lanes;
+    Extents size;
+    ffi::DataType slot;
+    ffi::DataType cell;
+    int64_t environments;
+};
 
-    if (args.size() != kInOperands || rets.size() != kResults || strategy < kCancelBoth || strategy > kCancelAlternating) {
-        return ffi::Error::InvalidArgument("nanorts_step takes 33 operands and a strategy, and returns 30 results");
-    }
-
-    std::vector<ffi::AnyBuffer> operand;
-    std::vector<ffi::AnyBuffer> result;
-
+ffi::Error collect_buffers(ffi::RemainingArgs args, ffi::RemainingRets rets, std::vector<ffi::AnyBuffer>& operand, std::vector<ffi::AnyBuffer>& result) {
     for (size_t k = 0; k < args.size(); ++k) {
         auto buffer = args.get<ffi::AnyBuffer>(k);
 
@@ -336,6 +453,10 @@ ffi::Error Step(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets
         result.push_back(**buffer);
     }
 
+    return ffi::Error::Success();
+}
+
+ffi::ErrorOr<BoundLanes> bind_lanes(cudaStream_t stream, const ffi::AnyBuffer* operand, ffi::AnyBuffer* result) {
     const int64_t environments = nanorts::lanes(result[0]);
     auto slots = operand[kInLeaves + kBirth].dimensions();
     auto board = operand[kInLeaves + kEntityAt].dimensions();
@@ -433,8 +554,9 @@ ffi::Error Step(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets
     for (const Expected& e : leaves) {
         const ffi::AnyBuffer& source = operand[kInLeaves + e.index];
         ffi::AnyBuffer& place = result[e.index];
+        const bool aliased = e.index < kTime;
 
-        if (nanorts::lanes(source) != environments || source.size_bytes() != place.size_bytes()) {
+        if (nanorts::lanes(place) != environments || (aliased && (nanorts::lanes(source) != environments || source.size_bytes() != place.size_bytes()))) {
             return ffi::Error::InvalidArgument("nanorts_step: a written leaf's result has its operand's lanes");
         }
 
@@ -450,8 +572,12 @@ ffi::Error Step(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets
             return written.error();
         }
 
-        if (source.untyped_data() != place.untyped_data() && place.size_bytes() > 0 && cudaMemcpyAsync(place.untyped_data(), source.untyped_data(), place.size_bytes(), cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+        if (aliased && source.untyped_data() != place.untyped_data() && place.size_bytes() > 0 && cudaMemcpyAsync(place.untyped_data(), source.untyped_data(), place.size_bytes(), cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
             return ffi::Error::Internal("nanorts_step: cannot copy a leaf into place");
+        }
+
+        if (!aliased) {
+            lanes.operand[kInLeaves + e.index] = *read;
         }
 
         lanes.result[e.index] = *written;
@@ -478,36 +604,212 @@ ffi::Error Step(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets
         lanes.result[e.index] = *written;
     }
 
-    const int64_t per_warp = warp_bytes(size.owned);
+    return BoundLanes{lanes, size, slot, cell, environments};
+}
+
+template <typename Launch>
+void with_index_types(ffi::DataType slot, ffi::DataType cell, Launch launch) {
+    using ffi::DataType;
+
+    if (slot == DataType::S16 && cell == DataType::S16) {
+        launch(int16_t{}, int16_t{});
+    } else if (slot == DataType::S16) {
+        launch(int16_t{}, int32_t{});
+    } else if (cell == DataType::S16) {
+        launch(int32_t{}, int16_t{});
+    } else {
+        launch(int32_t{}, int32_t{});
+    }
+}
+
+constexpr int64_t kIndexableThreads = int64_t{1} << 32;
+
+struct Geometry {
+    int64_t warps;
+    unsigned threads;
+    size_t shared;
+
+    int64_t blocks(int64_t environments) const {
+        return (environments + warps - 1) / warps;
+    }
+
+    bool indexable(int64_t blocks) const {
+        return blocks * threads <= kIndexableThreads;
+    }
+};
+
+ffi::ErrorOr<Geometry> geometry_for(const BoundLanes& lanes, const char* target) {
+    int64_t per_warp = 0;
+    with_index_types(lanes.slot, lanes.cell, [&](auto slot, auto cell) { per_warp = warp_bytes<decltype(slot), decltype(cell)>(lanes.size.owned); });
     const int64_t warps = std::min<int64_t>(kWarpsPerBlock, kSharedBytes / per_warp);
 
     if (warps < 1) {
-        return ffi::Error::InvalidArgument("nanorts_step: one warp's working set exceeds the shared memory of a block");
+        return ffi::Error::InvalidArgument(std::string(target) + ": one warp's working set exceeds the shared memory of a block");
     }
 
-    if (environments == 0) {
+    return Geometry{warps, static_cast<unsigned>(warps * 32), static_cast<size_t>(warps * per_warp)};
+}
+
+ffi::Error Step(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets rets, std::string_view build_id, int64_t strategy) {
+    if (ffi::Error error = nanorts::check_build_id(build_id); error.failure()) {
+        return error;
+    }
+
+    if (args.size() != kInOperands || rets.size() != kResults || strategy < kCancelBoth || strategy > kCancelAlternating) {
+        return ffi::Error::InvalidArgument("nanorts_step takes 33 operands and a strategy, and returns 31 results");
+    }
+
+    std::vector<ffi::AnyBuffer> operand;
+    std::vector<ffi::AnyBuffer> result;
+
+    if (ffi::Error error = collect_buffers(args, rets, operand, result); error.failure()) {
+        return error;
+    }
+
+    auto bound = bind_lanes(stream, operand.data(), result.data());
+
+    if (bound.has_error()) {
+        return bound.error();
+    }
+
+    auto geometry = geometry_for(*bound, "nanorts_step");
+
+    if (geometry.has_error()) {
+        return geometry.error();
+    }
+
+    if (!geometry->indexable(geometry->blocks(bound->environments))) {
+        return ffi::Error::InvalidArgument("nanorts_step: one launch indexes at most 2^27 lanes");
+    }
+
+    if (bound->environments == 0) {
         return ffi::Error::Success();
     }
 
-    const unsigned blocks = static_cast<unsigned>((environments + warps - 1) / warps);
-    const unsigned threads = static_cast<unsigned>(warps * 32);
-    const size_t shared = static_cast<size_t>(warps * per_warp);
+    const BoundLanes& lanes = *bound;
+    const Geometry& launch = *geometry;
     const Strategy chosen = static_cast<Strategy>(strategy);
 
-    if (slot == DataType::S16 && cell == DataType::S16) {
-        step<int16_t, int16_t><<<blocks, threads, shared, stream>>>(lanes, size, chosen, environments);
-    } else if (slot == DataType::S16) {
-        step<int16_t, int32_t><<<blocks, threads, shared, stream>>>(lanes, size, chosen, environments);
-    } else if (cell == DataType::S16) {
-        step<int32_t, int16_t><<<blocks, threads, shared, stream>>>(lanes, size, chosen, environments);
-    } else {
-        step<int32_t, int32_t><<<blocks, threads, shared, stream>>>(lanes, size, chosen, environments);
-    }
+    with_index_types(lanes.slot, lanes.cell, [&](auto slot, auto cell) {
+        step<decltype(slot), decltype(cell)><<<static_cast<unsigned>(launch.blocks(lanes.environments)), launch.threads, launch.shared, stream>>>(lanes.lanes, lanes.size, chosen, lanes.environments);
+    });
 
     return nanorts::launched();
 }
 
+bool same_extents(const Extents& a, const Extents& b) {
+    return a.width == b.width && a.height == b.height && a.cells == b.cells && a.entities == b.entities && a.neutral == b.neutral && a.capacity == b.capacity && a.owned == b.owned && a.types == b.types;
+}
+
+ffi::Error StepGroups(cudaStream_t stream, ffi::RemainingArgs args, ffi::RemainingRets rets, std::string_view build_id, int64_t strategy, int64_t groups) {
+    if (ffi::Error error = nanorts::check_build_id(build_id); error.failure()) {
+        return error;
+    }
+
+    if (groups < 1 || args.size() != static_cast<size_t>(groups * kInOperands) || rets.size() != static_cast<size_t>(groups * kResults) || strategy < kCancelBoth || strategy > kCancelAlternating) {
+        return ffi::Error::InvalidArgument("nanorts_step_groups takes 33 operands per group and a strategy, and returns 31 results per group");
+    }
+
+    std::vector<ffi::AnyBuffer> operand;
+    std::vector<ffi::AnyBuffer> result;
+
+    if (ffi::Error error = collect_buffers(args, rets, operand, result); error.failure()) {
+        return error;
+    }
+
+    std::vector<BoundLanes> bound;
+
+    for (int64_t group = 0; group < groups; ++group) {
+        auto group_lanes = bind_lanes(stream, operand.data() + group * kInOperands, result.data() + group * kResults);
+
+        if (group_lanes.has_error()) {
+            return group_lanes.error();
+        }
+
+        if (!bound.empty() && (!same_extents(group_lanes->size, bound[0].size) || group_lanes->slot != bound[0].slot || group_lanes->cell != bound[0].cell)) {
+            return ffi::Error::InvalidArgument("nanorts_step_groups: the groups' Buckets disagree");
+        }
+
+        bound.push_back(*group_lanes);
+    }
+
+    GroupLanes table{};
+
+    for (int row = 0; row < kRows; ++row) {
+        bool strided = false;
+
+        for (const BoundLanes& group_lanes : bound) {
+            if (group_lanes.environments < 2) {
+                continue;
+            }
+
+            const int64_t stride = row_of(group_lanes.lanes, row).stride;
+
+            if (strided && stride != table.stride[row]) {
+                return ffi::Error::InvalidArgument("nanorts_step_groups: the groups' rows disagree");
+            }
+
+            table.stride[row] = stride;
+            strided = true;
+        }
+    }
+
+    const Extents& size = bound[0].size;
+    auto geometry = geometry_for(bound[0], "nanorts_step_groups");
+
+    if (geometry.has_error()) {
+        return geometry.error();
+    }
+
+    const Geometry& launch = *geometry;
+    const Strategy chosen = static_cast<Strategy>(strategy);
+
+    for (int64_t chunk = 0; chunk < groups; chunk += kGroupsPerLaunch) {
+        const int64_t chunk_groups = std::min<int64_t>(kGroupsPerLaunch, groups - chunk);
+        int64_t blocks = 0;
+
+        for (int32_t group = 0; group < kGroupsPerLaunch; ++group) {
+            if (group >= chunk_groups) {
+                table.first_block[group] = UINT32_MAX;
+                table.lane_end[group] = 0;
+                continue;
+            }
+
+            const BoundLanes& group_lanes = bound[static_cast<size_t>(chunk + group)];
+            const int64_t first = blocks * launch.warps;
+
+            for (int row = 0; row < kRows; ++row) {
+                table.data[group][row] = reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(row_of(group_lanes.lanes, row).data) - static_cast<uintptr_t>(first * table.stride[row]));
+            }
+
+            table.first_block[group] = static_cast<uint32_t>(blocks);
+            table.lane_end[group] = static_cast<uint32_t>(first + group_lanes.environments);
+            blocks += launch.blocks(group_lanes.environments);
+
+            if (!launch.indexable(blocks)) {
+                return ffi::Error::InvalidArgument("nanorts_step_groups: one launch indexes at most 2^27 lanes");
+            }
+        }
+
+        if (blocks == 0) {
+            continue;
+        }
+
+        with_index_types(bound[0].slot, bound[0].cell, [&](auto slot, auto cell) {
+            step_groups<decltype(slot), decltype(cell)><<<static_cast<unsigned>(blocks), launch.threads, launch.shared, stream>>>(table, size, chosen);
+        });
+
+        if (ffi::Error error = nanorts::launched(); error.failure()) {
+            return error;
+        }
+    }
+
+    return ffi::Error::Success();
+}
+
 const nanorts::Kernels nanorts_step_kernels("nanorts_step", {nanorts::kernel(step<int16_t, int16_t>), nanorts::kernel(step<int16_t, int32_t>), nanorts::kernel(step<int32_t, int16_t>), nanorts::kernel(step<int32_t, int32_t>)});
+
+const nanorts::Kernels nanorts_step_groups_kernels("nanorts_step_groups", {nanorts::kernel(step_groups<int16_t, int16_t>), nanorts::kernel(step_groups<int16_t, int32_t>), nanorts::kernel(step_groups<int32_t, int16_t>), nanorts::kernel(step_groups<int32_t, int32_t>)});
 
 }
 
@@ -518,3 +820,12 @@ NANORTS_HANDLER(nanorts_step, Step,
                     .RemainingRets()
                     .Attr<std::string_view>("build_id")
                     .Attr<int64_t>("strategy"));
+
+NANORTS_HANDLER(nanorts_step_groups, StepGroups,
+                ffi::Ffi::Bind()
+                    .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                    .RemainingArgs()
+                    .RemainingRets()
+                    .Attr<std::string_view>("build_id")
+                    .Attr<int64_t>("strategy")
+                    .Attr<int64_t>("groups"));

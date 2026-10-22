@@ -67,7 +67,11 @@ _DIRECTIONAL_KINDS: Final[tuple[int, ...]] = (
 
 _TARGET: Final[str] = "nanorts_obi_act"
 
-_BYTES_PER_CELL: Final[int] = 18
+_BYTES_PER_CELL: Final[int] = 8
+
+_BYTES_PER_BOARD_WORD: Final[int] = 68
+
+_BOARD_WORD_BITS: Final[int] = 32
 
 _LANE_BYTES: Final[int] = 16
 
@@ -836,6 +840,7 @@ def _fits(bucket: BucketSpec) -> bool:
         bucket,
         bytes_per_cell=_BYTES_PER_CELL,
         lane_bytes=_LANE_BYTES
+        + _BYTES_PER_BOARD_WORD * -(-bucket.cell_count // _BOARD_WORD_BITS)
         + _BYTES_PER_CANDIDATE * len(_candidates(bucket).kind)
         + _BYTES_PER_TYPE * bucket.unit_type_capacity,
         bytes_per_slot=_BYTES_PER_SLOT,
@@ -855,10 +860,9 @@ def _kernel(key: Array, jobs: Jobs, state: State, game: GameConfig, player: Arra
 
 
 def _operands(key: Array, state: State, game: GameConfig) -> list[Array]:
-    grid = _legality(state, game)
     return [
         state.pending_none_duration,
-        *(getattr(grid, field.name) for field in dataclasses.fields(Legality)),
+        whole_act.legality_words(_legality(state, game)),
         jax.random.key_data(key),
         jnp.asarray(attack_offsets(game.bucket)),
     ]

@@ -7,7 +7,15 @@ from nanorts.adapters.jaxmarl.actions import (
     slot_cells,
     unpack_mask,
 )
-from nanorts.adapters.jaxmarl.env import JaxMARLStep, reset, step, step_against
+from nanorts.adapters.jaxmarl.env import (
+    JaxMARLStep,
+    request,
+    request_against,
+    reset,
+    respond,
+    step,
+    step_against,
+)
 from nanorts.adapters.jaxmarl.facade import (
     ALL_AGENTS,
     ENVIRONMENT_IDS,
@@ -60,7 +68,10 @@ __all__ = [
     "map_name_to_scenario",
     "observe",
     "prepare",
+    "request",
+    "request_against",
     "reset",
+    "respond",
     "scenario_names",
     "shipped_map",
     "slot_cells",

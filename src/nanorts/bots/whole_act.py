@@ -6,7 +6,7 @@ from typing import Any, Final
 
 import jax
 import jax.numpy as jnp
-from jax import Array
+from jax import Array, lax
 
 from nanorts import kernels
 from nanorts.model import (
@@ -14,6 +14,7 @@ from nanorts.model import (
     BucketSpec,
     Commands,
     GameConfig,
+    Legality,
     State,
     host_arrays,
 )
@@ -46,6 +47,8 @@ _COMMAND_FIELDS: Final[tuple[str, ...]] = tuple(
 
 _SHARED_BYTES: Final[int] = 48 * 1024
 
+_OPT_IN_SHARED_BYTES: Final[int] = 227 * 1024
+
 _WARP: Final[int] = 32
 
 _MIN_THREADS: Final[int] = 64
@@ -55,6 +58,8 @@ _MAX_THREADS: Final[int] = 256
 _KEY_PRNG: Final[str] = "threefry2x32"
 
 _FLOAT_DRAWS_SHOWN_ON: Final[frozenset[str]] = frozenset({"8.9"})
+
+_WORD_BITS: Final[int] = 32
 
 
 def _threads(capacity: int) -> int:
@@ -69,7 +74,10 @@ def fits(bucket: BucketSpec, *, bytes_per_cell: int, lane_bytes: int, bytes_per_
         + capacity * bytes_per_slot
         + bucket.entity_capacity * bytes_per_entity
     )
-    return _threads(capacity) <= _MAX_THREADS and shared <= _SHARED_BYTES
+    return _threads(capacity) <= _MAX_THREADS and (
+        shared <= _SHARED_BYTES
+        or shared <= min(_OPT_IN_SHARED_BYTES, kernels.shared_opt_in_bytes())
+    )
 
 
 def unit_table(game: GameConfig, columns: Sequence[str] = _TABLE_COLUMNS) -> Array:
@@ -81,6 +89,25 @@ def unit_table(game: GameConfig, columns: Sequence[str] = _TABLE_COLUMNS) -> Arr
         ],
         jnp.int32,
     )
+
+
+def legality_words(grid: Legality) -> Array:
+    rows = jnp.concatenate(
+        [
+            grid.kind,
+            grid.move_direction,
+            grid.harvest_direction,
+            grid.return_direction,
+            grid.produce_direction,
+            grid.produce_type,
+            grid.attack_offset,
+        ],
+        axis=-1,
+    )
+    words = -(-rows.shape[-1] // _WORD_BITS)
+    padded = jnp.pad(rows, [(0, 0)] * (rows.ndim - 1) + [(0, words * _WORD_BITS - rows.shape[-1])])
+    bits = padded.reshape(*rows.shape[:-1], words, _WORD_BITS).astype(jnp.uint32)
+    return jnp.sum(bits << lax.iota(jnp.uint32, _WORD_BITS), axis=-1, dtype=jnp.uint32)
 
 
 def act[Carry](target: str, carry: Carry, state: State, game: GameConfig, player: Array | int, *, attributes: dict[str, int], operands: Sequence[Array] = ()) -> tuple[Carry, Commands]:

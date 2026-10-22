@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 from jax import Array, lax
 
+from nanorts.core import residue
 from nanorts.model import (
     ABSENT,
     KIND_ABSENT,
@@ -71,11 +72,13 @@ def resolve(key: Array, state: State, game: GameConfig, pending_ranking: Array, 
         existing, request.reservation, state.player_resources
     )
     cross_cycle = state.pending_issued_at != state.time
-    draws = draws_for(key, state.time, state.birth[request.slot], game)
     entries = _in_pending_order(
         conflicts, cross_cycle, existing_duration, pending_ranking
     )
     counts = _running_conflict_counts(entries)
+    draws = _consumed_draws(
+        key, state.time, state.birth[request.slot], counts.same_cycle_total, game
+    )
     cancels_request, cancels_pending = _cancelled_sides(
         counts.same_cycle_before, state.alternating_conflict_count, draws, game
     )
@@ -229,13 +232,14 @@ def _inclusive_prefix(values: Array, identity: int, combine: Callable[[Array, Ar
     length = values.shape[0]
     stride = 1
     while stride < length:
+        shifts = range(stride, min(length, _PREFIX_RADIX * stride), stride)
+        widest = shifts[-1]
+        padded = lax.pad(values, identity, [(widest, 0, 0)])
         combined = values
-        for copy in range(1, _PREFIX_RADIX):
-            shift = copy * stride
-            if shift >= length:
-                break
+        for shift in shifts:
+            start = widest - shift
             combined = combine(
-                lax.pad(values, identity, [(shift, -shift, 0)]), combined
+                lax.slice_in_dim(padded, start, start + length), combined
             )
         values = combined
         stride *= _PREFIX_RADIX
@@ -258,16 +262,48 @@ def _cancelled_sides(same_cycle_before: Array, alternating_count: Array, draws: 
 def draws_for(key: Array, time: Array, birth: Array, game: GameConfig) -> Array:
     if game.bucket.conflict_strategy != ConflictStrategy.CANCEL_RANDOM:
         return jnp.zeros((0,), jnp.int32)
+    event_key = _event_key(key, time, birth)
+    return jax.vmap(lambda ordinal: _draw(event_key, ordinal))(
+        jnp.arange(game.bucket.entity_capacity, dtype=jnp.int32)
+    )
+
+
+def _consumed_draws(key: Array, time: Array, birth: Array, count: Array, game: GameConfig) -> Array:
+    if game.bucket.conflict_strategy != ConflictStrategy.CANCEL_RANDOM:
+        return jnp.zeros((0,), jnp.int32)
+
+    def every_ordinal(key: Array, time: Array, birth: Array, count: Array) -> Array:
+        return draws_for(key, time, birth, game)
+
+    def drawn_ordinals(key: Array, time: Array, birth: Array, count: Array) -> Array:
+        return _draws_below(key, time, birth, count, game)
+
+    return lax.platform_dependent(
+        key, time, birth, count, cpu=drawn_ordinals, default=every_ordinal
+    )
+
+
+def _draws_below(key: Array, time: Array, birth: Array, count: Array, game: GameConfig) -> Array:
+    event_key = _event_key(key, time, birth)
+
+    def draw(ordinal: Array, draws: Array) -> Array:
+        return residue.masked_set(draws, ordinal, True, _draw(event_key, ordinal))
+
+    return residue.visit_in_order(
+        count, draw, jnp.zeros(game.bucket.entity_capacity, jnp.int32)
+    )
+
+
+def _event_key(key: Array, time: Array, birth: Array) -> Array:
     event_key = jax.random.fold_in(key, time)
     event_key = jax.random.fold_in(event_key, birth)
-    event_key = jax.random.fold_in(event_key, _CONFLICT_EVENT)
+    return jax.random.fold_in(event_key, _CONFLICT_EVENT)
 
-    def draw(ordinal: Array) -> Array:
-        return jax.random.randint(
-            jax.random.fold_in(event_key, ordinal), (), 0, 2, dtype=jnp.int32
-        )
 
-    return jax.vmap(draw)(jnp.arange(game.bucket.entity_capacity, dtype=jnp.int32))
+def _draw(event_key: Array, ordinal: Array) -> Array:
+    return jax.random.randint(
+        jax.random.fold_in(event_key, ordinal), (), 0, 2, dtype=jnp.int32
+    )
 
 
 def kernel_draws_valid(key: Array) -> bool:
