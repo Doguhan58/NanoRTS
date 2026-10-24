@@ -153,7 +153,7 @@ def _check_glyph_band_holds(bound: Mapping[str, int]) -> None:
     if kind > KIND_WIDTH:
         raise RenderError(
             f"the content reaches Pending action kind {kind} and the Glyph "
-            f"band draws {KIND_WIDTH} unary pixels, so a Pixel observation of "
+            f"band draws one pixel for each of {KIND_WIDTH} kinds, so a Pixel observation of "
             "it would not carry the value"
         )
     carried = bound["carried_resources"]

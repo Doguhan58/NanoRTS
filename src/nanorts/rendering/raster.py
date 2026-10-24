@@ -69,7 +69,7 @@ def _banded(cells: Array, occupied: Array, kind: Array, stack: Array, hit_points
     )
     lit = jnp.where(
         row == BAND_ROWS[0],
-        kind[..., None, None] > position,
+        kind[..., None, None] == position + 1,
         jnp.where(
             row == BAND_ROWS[1],
             ((stack[..., None, None] >> position) & 1) != 0,
